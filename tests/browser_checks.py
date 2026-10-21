@@ -114,6 +114,17 @@ class BrowserChecks(unittest.TestCase):
         self.assertEqual(self.page.evaluate("window.sends"), 1)
         self.assertEqual(self.adapter.profile_state(), "pending")
 
+    def test_more_menu_retries_only_read_only_open_when_first_click_is_not_ready(self):
+        def hydration(html):
+            html = re.sub(r'<button id="connect"[^>]*>Connect</button>', '', html)
+            more = '''<button aria-label="More" onclick="window.moreClicks=(window.moreClicks||0)+1;if(window.moreClicks>1)document.querySelector('#profile-menu').hidden=false">More</button>'''
+            menu = '<div id="profile-menu" role="menu" hidden><button>Connect</button></div>'
+            return html.replace('</section></main>', more + '</section></main>' + menu)
+        self.fixture(transform=hydration)
+        self.assertEqual(self.adapter.open_profile(LEAD), "new")
+        self.assertEqual(self.page.evaluate('window.moreClicks'), 2)
+        self.assertIsNone(self.page.evaluate('window.sends'))
+
     def test_delayed_note_editor_is_waited_for_before_sending(self):
         self.fixture(transform=lambda html: html.replace("onclick=\"document.querySelector('textarea').hidden=false\"", "onclick=\"setTimeout(() => document.querySelector('textarea').hidden=false, 300)\""))
         self.assertEqual(self.adapter.open_profile(LEAD), "new")

@@ -14,7 +14,7 @@ import time
 import unicodedata
 from urllib.parse import parse_qs, urljoin, urlsplit
 
-from playwright.sync_api import Error as BrowserError, sync_playwright
+from playwright.sync_api import Error as BrowserError, TimeoutError as BrowserTimeoutError, sync_playwright
 
 from outreach_errors import StopRun
 from lead_data import canonical_profile
@@ -223,10 +223,19 @@ class LinkedInBrowser:
         return self.button(root, r"^(?:Connect(?: with .+)?|Invite .+ to connect)$", "connect action")
 
     def more_menu(self):
-        more = self.button(self.topcard(), r"^(?:More|More actions)$", "profile More button", optional=False)
-        more.click()
         menus = self.page.locator('[role="menu"]:visible, .artdeco-dropdown__content-inner:visible')
-        menus.first.wait_for(state="visible", timeout=10000)
+        for attempt in range(2):
+            more = self.button(self.topcard(), r"^(?:More|More actions)$", "profile More button", optional=False)
+            more.click()
+            try:
+                menus.first.wait_for(state="visible", timeout=10000)
+                break
+            except BrowserTimeoutError:
+                self.guard()
+                # Some profiles paint controls before attaching their handlers.
+                # Retry only the read-only menu opener, never Connect or Send.
+                if attempt or more.get_attribute("aria-expanded") == "true":
+                    raise StopRun("Profile More menu did not become readable; no invitation sent") from None
         menu = self.one_visible(menus, "profile More menu")
         self.last_profile_menu = menu.evaluate("""root => ({text:root.innerText,
             controls:[...root.querySelectorAll('button,a,[role="menuitem"],[role="button"]')]
