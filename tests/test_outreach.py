@@ -233,6 +233,26 @@ class OutreachTests(unittest.TestCase):
         self.assertEqual(invite_capacity(self.store, self.cfg, NOW + timedelta(days=7, seconds=1)), 1)
         self.assertEqual(day_start(NOW, self.cfg).hour, 4)
 
+    def test_ongoing_campaign_reaches_25_without_counting_followup_messages(self):
+        self.cfg.update(campaign_invitation_limit=None, invitations_per_run=25,
+                        invitations_per_day=25, invitations_per_7_days=175, acceptance_checks_per_run=100)
+        for number in range(1, 26):
+            self.add_lead(f"daily-{number}")
+        result = self.campaign(FakeBrowser()).run()
+        self.assertEqual(result["invitations_sent"], 25)
+        self.assertEqual(invite_capacity(self.store, self.cfg, NOW), 0)
+        self.store.begin(1, "message_1", "A separate follow-up", NOW)
+        self.store.sent(1, "message_1", NOW)
+        self.assertEqual(self.store.used("invite"), 25)
+        self.assertEqual(self.store.used("message"), 1)
+        self.assertEqual(invite_capacity(self.store, self.cfg, NOW + timedelta(days=1)), 25)
+        self.assertFalse(campaign_finished(self.store, self.cfg))
+
+    def test_ongoing_campaign_finishes_when_no_eligible_or_active_leads_remain(self):
+        self.cfg["campaign_invitation_limit"] = None
+        self.store.update(1, state="stopped", reason="Stopped by operator")
+        self.assertTrue(campaign_finished(self.store, self.cfg))
+
     def test_scheduler_uses_eastern_weekdays_and_hours(self):
         self.assertTrue(working_time(NOW, self.cfg))
         self.assertFalse(working_time(NOW.replace(hour=0), self.cfg))

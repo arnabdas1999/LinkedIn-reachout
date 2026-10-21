@@ -70,6 +70,12 @@ class SetupTests(unittest.TestCase):
             with self.subTest(values=values), self.assertRaises((ValueError, KeyError)):
                 self.config(**values)
 
+    def test_total_cap_can_be_disabled_but_rejects_invalid_values(self):
+        self.assertIsNone(self.config(campaign_invitation_limit=None)["campaign_invitation_limit"])
+        for value in (0, -1, True, "unlimited"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.config(campaign_invitation_limit=value)
+
     def test_background_start_requires_explicit_live_flag(self):
         self.config()
         with patch("outreach_setup.subprocess.Popen") as launch:

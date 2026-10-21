@@ -37,6 +37,8 @@ Use **Show Outreach Progress.cmd** to check progress and **Stop LinkedIn Outreac
 
 The initial campaign cap is **one invitation total**, even across restarts and subsequent days. Review the result before increasing `campaign_invitation_limit` and the daily/weekly caps in your private settings. These caps are local controls, not LinkedIn-approved thresholds.
 
+For an ongoing campaign, set `campaign_invitation_limit` to `null`. Daily and rolling seven-day invitation limits still apply. For example, 25 per day can use `invitations_per_day: 25`, `invitations_per_7_days: 175`, and `invitations_per_run: 5`. Include all seven values `[0, 1, 2, 3, 4, 5, 6]` in `working_days` to include weekends. Follow-up messages have separate limits and do not consume the new-invitation allowance.
+
 ## Command-line setup
 
 On macOS/Linux:
@@ -122,7 +124,7 @@ Useful settings in [settings.example.json](settings.example.json):
 
 | Setting | Meaning |
 | --- | --- |
-| `campaign_invitation_limit` | Total invitations for this saved campaign, across all runs. |
+| `campaign_invitation_limit` | Total invitations across all runs; `null` disables the total cap while keeping daily/weekly limits. |
 | `invitations_per_run`, `invitations_per_day`, `invitations_per_7_days` | Additional invitation ceilings; seven days is a rolling window. |
 | `messages_per_run`, `messages_per_day` | Follow-up limits. |
 | `working_days`, `working_hours`, `timezone` | Watcher schedule. Monday is 0; end hour is exclusive. |

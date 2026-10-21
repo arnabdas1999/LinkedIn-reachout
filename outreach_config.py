@@ -25,7 +25,7 @@ DEFAULTS = {
     "message_2": "Hi {first_name}, would you be open to a 15-minute chat next week about what the team at {company} is working on? Happy to work around your schedule.",
 }
 POSITIVE_INTS = (
-    "campaign_invitation_limit", "invitations_per_run", "invitations_per_day",
+    "invitations_per_run", "invitations_per_day",
     "invitations_per_7_days", "messages_per_run", "messages_per_day",
     "acceptance_checks_per_run", "check_interval_minutes", "watch_interval_minutes",
     "minimum_seconds_between_sends", "message_1_delay_days", "message_2_delay_days",
@@ -85,6 +85,9 @@ def load_settings(path=None):
     for key in POSITIVE_INTS:
         if type(cfg[key]) is not int or cfg[key] < 1:
             raise ValueError(f"{key} must be a positive integer")
+    total = cfg["campaign_invitation_limit"]
+    if total is not None and (type(total) is not int or total < 1):
+        raise ValueError("campaign_invitation_limit must be a positive integer or null for no total cap")
     if cfg["browser_channel"] not in ("brave", "msedge", "chrome", "chromium"):
         raise ValueError("browser_channel must be brave, msedge, chrome or chromium")
     if type(cfg["headless"]) is not bool:

@@ -257,12 +257,14 @@ def day_start(now, cfg):
 
 
 def invite_capacity(store, cfg, now):
-    return max(0, min(
+    limits = [
         cfg["invitations_per_run"],
-        cfg["campaign_invitation_limit"] - store.used("invite"),
         cfg["invitations_per_day"] - store.used("invite", day_start(now, cfg)),
         cfg["invitations_per_7_days"] - store.used("invite", now - timedelta(days=7)),
-    ))
+    ]
+    if cfg["campaign_invitation_limit"] is not None:
+        limits.append(cfg["campaign_invitation_limit"] - store.used("invite"))
+    return max(0, min(limits))
 
 
 def working_time(now, cfg):
@@ -405,7 +407,9 @@ def profile_directory(channel="chromium", workspace=None, profile_path=None):
 
 def campaign_finished(store, cfg):
     active = store.db.execute("SELECT count(*) FROM leads WHERE state IN ('invited','accepted','message_1_sent')").fetchone()[0]
-    return not active and (store.used("invite") >= cfg["campaign_invitation_limit"] or not store.candidates(cfg.get("company_filter", "")))
+    cap = cfg["campaign_invitation_limit"]
+    cap_reached = cap is not None and store.used("invite") >= cap
+    return not active and (cap_reached or not store.candidates(cfg.get("company_filter", "")))
 
 
 def wait_for_stop(path, seconds):
