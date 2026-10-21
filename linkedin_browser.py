@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 
 from playwright.sync_api import Error as BrowserError, TimeoutError as BrowserTimeoutError, sync_playwright
 
-from outreach_errors import StopRun
+from outreach_errors import ProfileNeedsReview, StopRun
 from lead_data import canonical_profile
 
 
@@ -289,10 +289,10 @@ class LinkedInBrowser:
         except ValueError:
             raise StopRun("Profile navigation redirected to an unexpected URL") from None
         if actual_url != lead["url"]:
-            raise StopRun("Profile URL changed. Review this lead before sending anything")
+            raise ProfileNeedsReview("Profile URL changed. Review this lead before sending anything")
         name = self.one_visible(self.profile_heading(), "profile name").inner_text()
         if normalized(name) != normalized(lead["full_name"]):
-            raise StopRun(f"Profile name mismatch: CSV has {lead['full_name']!r}; page shows {name!r}")
+            raise ProfileNeedsReview(f"Profile name mismatch: CSV has {lead['full_name']!r}; page shows {name!r}")
         return self.profile_state()
 
     def invitation_dialog(self, lead):

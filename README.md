@@ -157,7 +157,8 @@ linkedin-outreach stop 1                  # Stop one person's sequence, with wor
 - **Already running:** use `status`; stop the existing worker before login, inspection or changing settings. Do not delete lock files to bypass a live process.
 - **No new invites:** check the total campaign cap, daily/weekly caps, company filter, working window and existing Pending/connected state.
 - **Login/verification required:** complete `login` manually. There is no automated challenge bypass.
-- **Unexpected UI/identity mismatch:** stop and inspect the exact profile. Website selector updates may be necessary.
+- **Identity mismatch before an action:** that person is held for review and verified profiles continue. Check `status` and review their CSV identity; the app does not guess that abbreviated names identify the same person.
+- **Unexpected UI, login or verification issue:** the worker stops. Inspect the exact profile or complete login; website selector updates may be necessary.
 - **Uncertain send:** inspect LinkedIn before resolving it, as described below.
 
 Logs are in `.local/outreach.log` with rotation, plus `watch-output.log` and `watch-error.log` for detached runs. Logs, screenshots and CSV reports can contain contact data. Redact them before sharing. This app has no hosted backend or telemetry; normal browser traffic goes to LinkedIn. Files inside cloud-synced folders follow that folder's sync settings. Prefer a local, unsynced campaign-state directory for database reliability.

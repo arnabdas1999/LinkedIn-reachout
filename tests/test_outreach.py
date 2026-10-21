@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 from outreach import Campaign, Store, StopRequested, StopRun, campaign_finished, canonical_profile, day_start, due_message, invite_capacity, load_settings, render, stamp, working_time
+from outreach_errors import ProfileNeedsReview
 
 NOW = datetime(2026, 10, 21, 16, 0, tzinfo=timezone.utc)
 ROOT = Path(__file__).resolve().parents[1]
@@ -193,6 +194,59 @@ class OutreachTests(unittest.TestCase):
                 self.campaign(browser).run()
                 self.assertEqual(self.store.lead(1)["state"], "skipped")
                 self.assertEqual(browser.sends, [])
+
+    def test_identity_mismatch_holds_one_lead_and_continues_verified_profiles(self):
+        self.add_lead("verified")
+        browser = FakeBrowser()
+        def open_profile(lead):
+            if lead["id"] == 1:
+                raise ProfileNeedsReview("Profile name mismatch")
+            return "new"
+        browser.open_profile = open_profile
+        result = self.campaign(browser).run()
+        self.assertEqual(result["invitations_sent"], 1)
+        self.assertEqual(self.store.lead(1)["state"], "needs_review")
+        self.assertIsNone(self.store.db.execute('SELECT 1 FROM actions WHERE lead_id=1').fetchone())
+        self.assertEqual(browser.sends[0][0], 2)
+
+    def test_identity_mismatch_during_acceptance_check_preserves_sent_history(self):
+        self.invite()
+        self.add_lead("verified")
+        self.cfg["campaign_invitation_limit"] = 2
+        self.cfg["invitations_per_day"] = 2
+        browser = FakeBrowser()
+        def open_profile(lead):
+            if lead["id"] == 1:
+                raise ProfileNeedsReview("Profile name mismatch")
+            return "new"
+        browser.open_profile = open_profile
+        self.campaign(browser).run()
+        self.assertEqual(self.store.lead(1)["state"], "needs_review")
+        self.assertEqual(self.store.sent_messages(1).keys(), {"invite"})
+        self.assertEqual(self.store.lead(2)["state"], "invited")
+
+    def test_account_or_verification_stops_are_not_treated_as_profile_holds(self):
+        self.add_lead("next")
+        browser = FakeBrowser()
+        def open_profile(lead):
+            raise StopRun("LinkedIn needs verification")
+        browser.open_profile = open_profile
+        with self.assertRaises(StopRun):
+            self.campaign(browser).run()
+        self.assertEqual(browser.sends, [])
+        self.assertEqual(self.store.lead(1)["state"], "new")
+        self.assertEqual(self.store.lead(2)["state"], "new")
+
+    def test_identity_error_during_a_prepared_send_still_blocks_all_retries(self):
+        self.add_lead("next")
+        browser = FakeBrowser()
+        def send_invitation(lead, message):
+            raise ProfileNeedsReview("Identity changed while preparing")
+        browser.send_invitation = send_invitation
+        with self.assertRaises(StopRun):
+            self.campaign(browser).run()
+        self.assertEqual(self.store.unresolved(), 1)
+        self.assertEqual(self.store.lead(2)["state"], "new")
 
     def test_followup_clock_starts_when_acceptance_is_observed(self):
         self.invite(NOW - timedelta(days=10))

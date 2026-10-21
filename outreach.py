@@ -17,7 +17,7 @@ import time
 from zoneinfo import ZoneInfo
 
 from outreach_config import VERSION, load_settings, read_json, resolve_path, state_path
-from outreach_errors import StopRequested, StopRun
+from outreach_errors import ProfileNeedsReview, StopRequested, StopRun
 
 from lead_data import (SOURCE_DATA_REASON, SOURCE_DATA_REASONS, canonical_profile,
                        name_parts, read_clean_csv)
@@ -310,7 +310,12 @@ class Campaign:
         messages = 0
         for lead in self.store.active_due(self.now(), self.cfg["acceptance_checks_per_run"]):
             self.check_stop()
-            state = self.browser.open_profile(lead)
+            try:
+                state = self.browser.open_profile(lead)
+            except ProfileNeedsReview as exc:
+                self.store.update(lead["id"], state="needs_review", reason=str(exc))
+                LOG.warning("HELD %s for identity review; other profiles can continue: %s", lead["full_name"], exc)
+                continue
             next_check = stamp(self.now() + timedelta(minutes=self.cfg["check_interval_minutes"]))
             self.store.update(lead["id"], last_checked_at=stamp(self.now()), next_check_at=next_check)
             if lead["state"] == "invited" and state == "pending":
@@ -347,7 +352,12 @@ class Campaign:
             except ValueError as exc:
                 self.store.update(lead["id"], state="needs_review", reason=str(exc))
                 continue
-            state = self.browser.open_profile(lead)
+            try:
+                state = self.browser.open_profile(lead)
+            except ProfileNeedsReview as exc:
+                self.store.update(lead["id"], state="needs_review", reason=str(exc))
+                LOG.warning("HELD %s for identity review; no invitation sent: %s", lead["full_name"], exc)
+                continue
             if state in ("pending", "connected", "unavailable"):
                 self.store.update(lead["id"], state="skipped", reason="Already " + state + "; not enrolled in this sequence")
                 LOG.info("SKIPPED %s: %s", lead["full_name"], state)

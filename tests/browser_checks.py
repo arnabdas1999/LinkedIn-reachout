@@ -13,6 +13,7 @@ from playwright.sync_api import sync_playwright
 
 from linkedin_browser import LinkedInBrowser, brave_executable
 from outreach import StopRun
+from outreach_errors import ProfileNeedsReview
 
 URL = "https://www.linkedin.com/in/alex/"
 LEAD = {"id": 1, "url": URL, "first_name": "Alex", "full_name": "Alex Example", "company": "Oracle"}
@@ -153,7 +154,7 @@ class BrowserChecks(unittest.TestCase):
 
     def test_changed_profile_name_prevents_connection(self):
         self.fixture(transform=lambda h: h.replace("<h1>Alex Example</h1>", "<h1>Someone Else</h1>"))
-        with self.assertRaises(StopRun):
+        with self.assertRaises(ProfileNeedsReview):
             self.adapter.open_profile(LEAD)
         self.assertIsNone(self.page.evaluate("window.sends"))
 
