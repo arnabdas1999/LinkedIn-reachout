@@ -1,0 +1,39 @@
+name: Test and package
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ['3.11', '3.13']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      OUTREACH_TEST_BROWSER: chromium
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: python -m pip install -e ".[dev]"
+      - run: python scripts/check_release.py
+      - run: python -m ruff check .
+      - run: python -m unittest discover -s tests -v
+      - run: python -m playwright install --with-deps chromium
+      - run: python -m unittest discover -s tests -p browser_checks.py -v
+      - run: python -m build
+      - run: python scripts/check_release.py --dist
+      - uses: actions/upload-artifact@v7
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.13'
+        with:
+          name: python-distributions
+          path: dist/*
+          if-no-files-found: error

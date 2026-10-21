@@ -1,0 +1,21 @@
+include requirements.txt
+include CONTRIBUTING.md SECURITY.md .gitignore .gitattributes
+include settings.example.json
+include *.cmd
+prune examples
+prune .local
+prune .venv
+prune data
+prune input
+prune inputs
+prune output
+prune outputs
+prune backups
+prune downloads
+prune screenshots
+recursive-include docs *.md
+recursive-include scripts *.py
+recursive-include tests *.py
+recursive-include .github *.yml
+global-exclude *.pyc
+global-exclude *.[cC][sS][vV] *.[tT][sS][vV] *.[xX][lL]* *.[oO][dD][sS] *.[oO][tT][sS] *.[nN][uU][mM][bB][eE][rR][sS]
