@@ -392,7 +392,7 @@ class LinkedInBrowser:
         if len(panels) != 1:
             raise StopRun(f"Expected one conversation panel; found {len(panels)}")
         panel, self.message_frame = panels[0]
-        headers = panel.locator(".msg-overlay-bubble-header")
+        headers = panel.locator(".msg-overlay-bubble-header:visible, .msg-overlay-conversation-bubble-header:visible")
         headers.first.wait_for(state="visible")
         header = self.one_visible(headers, "conversation header")
         names = header.locator("h2, .msg-overlay-bubble-header__title")

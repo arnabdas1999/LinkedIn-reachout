@@ -211,6 +211,32 @@ class BrowserChecks(unittest.TestCase):
             self.adapter.send_message(LEAD, MESSAGE, {"invite": NOTE})
         self.assertIsNone(self.page.evaluate("window.sends"))
 
+    def test_current_conversation_header_verifies_recipient_and_confirms_message(self):
+        self.fixture("1st", event(NOTE), lambda h: h.replace('<header class="msg-overlay-bubble-header">',
+                                                            '<header class="msg-overlay-conversation-bubble-header">'))
+        self.adapter.send_message(LEAD, MESSAGE, {"invite": NOTE})
+        self.assertEqual(self.page.evaluate("window.sends"), 1)
+        self.assertEqual(self.page.locator(".msg-s-event-listitem__body").last.inner_text(), MESSAGE)
+
+    def test_current_conversation_header_with_wrong_recipient_never_sends(self):
+        def changed_header(html):
+            return html.replace('<header class="msg-overlay-bubble-header">',
+                                '<header class="msg-overlay-conversation-bubble-header">').replace(
+                                    'class="msg-overlay-bubble-header__title">Alex Example',
+                                    'class="msg-overlay-bubble-header__title">Different Person')
+        self.fixture("1st", event(NOTE), changed_header)
+        with self.assertRaises(StopRun):
+            self.adapter.send_message(LEAD, MESSAGE, {"invite": NOTE})
+        self.assertIsNone(self.page.evaluate("window.sends"))
+
+    def test_current_conversation_header_still_stops_after_reply(self):
+        self.fixture("1st", event(NOTE) + event("Thanks for connecting", "alex"),
+                     lambda h: h.replace('<header class="msg-overlay-bubble-header">',
+                                         '<header class="msg-overlay-conversation-bubble-header">'))
+        with self.assertRaises(StopRun):
+            self.adapter.send_message(LEAD, MESSAGE, {"invite": NOTE})
+        self.assertIsNone(self.page.evaluate("window.sends"))
+
     def test_reply_in_thread_prevents_followup(self):
         self.fixture("1st", event(NOTE) + event("Thanks for connecting", "alex"))
         self.assertTrue(self.adapter.conversation(LEAD, {"invite": NOTE}).inbound)
