@@ -379,25 +379,43 @@ class LinkedInBrowser:
         raise StopRun("Clicked Send but could not verify Pending. Check LinkedIn; do not retry blindly")
 
     def open_conversation(self, lead):
-        panels = self.conversation_panels()
-        if not panels:
-            button = self.button(self.topcard(), r"^Message(?: .+)?$", "profile Message button", optional=False)
-            button.click()
-            deadline = time.monotonic() + 15
+        for attempt in range(2):
+            self.guard()
+            panels = self.conversation_panels()
+            if not panels:
+                button = self.button(self.topcard(), r"^Message(?: .+)?$", "profile Message button", optional=False)
+                button.click()
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline:
+                    panels = self.conversation_panels()
+                    if panels:
+                        break
+                    self.page.wait_for_timeout(250)
+            if len(panels) != 1:
+                # Like More, Message can render before its handler is ready.
+                # Only retry opening the conversation, never composing or sending.
+                if not panels and not attempt:
+                    continue
+                raise StopRun(f"Expected one conversation panel; found {len(panels)}")
+            panel, self.message_frame = panels[0]
+            headers = panel.locator(".msg-overlay-bubble-header:visible, .msg-overlay-conversation-bubble-header:visible")
+            headers.first.wait_for(state="visible")
+            header = self.one_visible(headers, "conversation header")
+            names = header.locator("h2, .msg-overlay-bubble-header__title")
+            deadline = time.monotonic() + 2
             while time.monotonic() < deadline:
-                panels = self.conversation_panels()
-                if panels:
+                if any(normalized(node.inner_text()) == normalized(lead["full_name"]) for node in names.all() if node.is_visible()):
                     break
-                self.page.wait_for_timeout(250)
-        if len(panels) != 1:
-            raise StopRun(f"Expected one conversation panel; found {len(panels)}")
-        panel, self.message_frame = panels[0]
-        headers = panel.locator(".msg-overlay-bubble-header:visible, .msg-overlay-conversation-bubble-header:visible")
-        headers.first.wait_for(state="visible")
-        header = self.one_visible(headers, "conversation header")
-        names = header.locator("h2, .msg-overlay-bubble-header__title")
-        if not any(normalized(node.inner_text()) == normalized(lead["full_name"]) for node in names.all() if node.is_visible()):
-            raise StopRun("Conversation recipient does not match the selected profile")
+                self.page.wait_for_timeout(100)
+            else:
+                self.guard(self.message_frame)
+                if attempt:
+                    raise StopRun("Conversation recipient does not match the selected profile")
+                # A previous thread can be restored after profile navigation.
+                # Close it without changing drafts, then select this profile again.
+                self.close_conversations()
+                continue
+            break
         editors = panel.locator('[contenteditable="true"][role="textbox"], .msg-form__contenteditable[contenteditable="true"]')
         editors.first.wait_for(state="visible")
         editor = self.one_visible(editors, "message editor")

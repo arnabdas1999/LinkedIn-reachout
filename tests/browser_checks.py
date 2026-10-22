@@ -237,6 +237,28 @@ class BrowserChecks(unittest.TestCase):
             self.adapter.send_message(LEAD, MESSAGE, {"invite": NOTE})
         self.assertIsNone(self.page.evaluate("window.sends"))
 
+    def test_restored_thread_is_closed_before_opening_selected_recipient(self):
+        def restored_thread(html):
+            html = html.replace('class="msg-overlay-conversation-bubble" style="display:none"',
+                                'class="msg-overlay-conversation-bubble" style="display:block"')
+            html = html.replace('class="msg-overlay-bubble-header__title">Alex Example',
+                                'class="msg-overlay-bubble-header__title">Previous Contact')
+            return html.replace("document.querySelector('.msg-overlay-conversation-bubble').style.display='block'",
+                                "document.querySelector('.msg-overlay-bubble-header__title').textContent='Alex Example';document.querySelector('.msg-overlay-conversation-bubble').style.display='block';window.messageOpens=(window.messageOpens||0)+1")
+        self.fixture("1st", event(NOTE), restored_thread)
+        self.adapter.send_message(LEAD, MESSAGE, {"invite": NOTE})
+        self.assertEqual(self.page.evaluate("window.messageOpens"), 1)
+        self.assertEqual(self.page.evaluate("window.sends"), 1)
+        self.assertEqual(self.page.locator('.msg-overlay-bubble-header__title').inner_text(), LEAD['full_name'])
+
+    def test_message_opener_retries_when_first_click_is_not_ready(self):
+        self.fixture("1st", event(NOTE), lambda html: html.replace(
+            "document.querySelector('.msg-overlay-conversation-bubble').style.display='block'",
+            "window.messageOpens=(window.messageOpens||0)+1;if(window.messageOpens>1)document.querySelector('.msg-overlay-conversation-bubble').style.display='block'"))
+        self.adapter.send_message(LEAD, MESSAGE, {"invite": NOTE})
+        self.assertEqual(self.page.evaluate("window.messageOpens"), 2)
+        self.assertEqual(self.page.evaluate("window.sends"), 1)
+
     def test_reply_in_thread_prevents_followup(self):
         self.fixture("1st", event(NOTE) + event("Thanks for connecting", "alex"))
         self.assertTrue(self.adapter.conversation(LEAD, {"invite": NOTE}).inbound)
