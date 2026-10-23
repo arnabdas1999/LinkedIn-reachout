@@ -32,7 +32,7 @@ class FakeBrowser:
         self.sends.append((lead["id"], "message", message))
 
 
-class OutreachTests(unittest.TestCase):
+class OutreachCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.path = Path(self.tmp.name) / "campaign.sqlite3"
@@ -59,6 +59,8 @@ class OutreachTests(unittest.TestCase):
         self.store.begin(1, "invite", render(self.store.lead(1), self.cfg)["invite"], now)
         self.store.sent(1, "invite", now)
 
+
+class OutreachTests(OutreachCase):
     def test_public_profile_urls_normalize_and_reject_external_domains(self):
         self.assertEqual(canonical_profile("https://linkedin.com/in/ALEX/?trk=abc"), "https://www.linkedin.com/in/alex/")
         for value in ("https://linkedin.com.evil.test/in/alex/", "https://www.linkedin.com/company/oracle/",
@@ -151,21 +153,18 @@ class OutreachTests(unittest.TestCase):
 
     def test_uncertain_send_is_not_retried_after_restart(self):
         browser = FakeBrowser(uncertain=True)
-        with self.assertRaises(StopRun):
-            self.campaign(browser).run()
+        self.assertEqual(self.campaign(browser).run()['invitations_sent'], 0)
         self.assertEqual(self.store.lead(1)["state"], "needs_review")
         self.store.close()
         self.store = Store(self.path)
-        with self.assertRaises(StopRun):
-            self.campaign(browser).run()
+        self.assertEqual(self.campaign(browser).run()['invitations_sent'], 0)
         self.assertEqual(len(browser.sends), 1)
 
     def test_crash_with_prepared_action_requires_reconciliation(self):
         self.store.begin(1, "invite", "hello", NOW)
         self.assertEqual(self.store.recover(), 1)
         self.assertEqual(self.store.lead(1)["state"], "needs_review")
-        with self.assertRaises(StopRun):
-            self.campaign(FakeBrowser()).run()
+        self.assertEqual(self.campaign(FakeBrowser()).run()['invitations_sent'], 0)
         self.store.reconcile(1, "sent", NOW + timedelta(hours=1))
         self.assertEqual(self.store.lead(1)["state"], "invited")
         self.assertEqual(self.store.unresolved(), 0)
@@ -237,14 +236,13 @@ class OutreachTests(unittest.TestCase):
         self.assertEqual(self.store.lead(1)["state"], "new")
         self.assertEqual(self.store.lead(2)["state"], "new")
 
-    def test_identity_error_during_a_prepared_send_still_blocks_all_retries(self):
+    def test_identity_error_during_a_prepared_send_holds_that_action(self):
         self.add_lead("next")
         browser = FakeBrowser()
         def send_invitation(lead, message):
             raise ProfileNeedsReview("Identity changed while preparing")
         browser.send_invitation = send_invitation
-        with self.assertRaises(StopRun):
-            self.campaign(browser).run()
+        self.campaign(browser).run()
         self.assertEqual(self.store.unresolved(), 1)
         self.assertEqual(self.store.lead(2)["state"], "new")
 

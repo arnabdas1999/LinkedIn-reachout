@@ -12,7 +12,7 @@ A local Python app that reads your contacts CSV, personalizes your message templ
 - Supports your connection note, a message after acceptance, and a later follow-up.
 - Stops a person's sequence when a reply or an unrecognized/manual message appears.
 - Journals sends before clicking, prevents parallel workers, and never blindly retries an uncertain send.
-- If an invitation form fails to open and a refreshed, identity-verified profile still offers Connect, holds that contact and continues with others. The held attempt counts toward invitation limits and is never retried automatically. Uncertain sends and account limits still stop the worker.
+- Isolates contact failures, retries read-only page loads, and recovers temporary browser failures with a cooldown. Held or uncertain sends are never automatically retried and still count toward limits.
 - Provides an offline preview, setup diagnostics, background start/stop, progress and rotating logs.
 
 ## Requirements
@@ -133,10 +133,31 @@ Useful settings in [settings.example.json](settings.example.json):
 | `company_filter` | Exact company filter for new invitations; active follow-ups continue. |
 | `state_directory` | Private campaign database, normalized CSV, reports and logs. |
 | `message_templates_file` | Your separate JSON templates; inline templates also work. |
+| `read_attempts` | Read-only navigation/history attempts per check; default 2, maximum 5. Connect and Send clicks are never retried. |
+| `contact_retry_limit` | Failed checks across cycles before holding a contact; default 3, persisted across restarts. |
+| `retry_initial_seconds`, `retry_max_seconds` | Exponential retry/cooldown range; defaults 60 and 1800 seconds. |
+| `max_consecutive_failures` | Contact failures before cooling down and opening a fresh browser; default 3. |
 
 Relative paths resolve beside `settings.json`, not beside the installed Python package. Select another settings file with `linkedin-outreach --settings /path/settings.json COMMAND`. Use a separate `state_directory` for a genuinely separate campaign; keep it unchanged when upgrading to retain duplicate protection.
 
 The computer must remain awake, online and signed into the OS. A background worker survives closing the terminal, but does not start itself after reboot. `run --live` executes one cycle immediately, including outside working hours. `watch --live` runs in the foreground; `start --live` detaches it. No actions run while the computer is asleep.
+
+## Recovery and reliability
+
+The background watcher supervises browser cycles. A slow page gets bounded read-only retries, then a scheduled retry for that contact. Other contacts continue. Retry schedules and failure counts survive restarts; a contact that keeps failing is held for review. The worker remains alive when all remaining contacts are waiting for a retry.
+
+| Failure | Behavior |
+| --- | --- |
+| Identity mismatch, unreadable recipient/history, existing draft in the selected thread | Hold that contact; continue with others without sending to the unverified recipient. |
+| Slow profile or conversation | Retry the read, then defer the contact with an increasing delay. Hold after the configured retry limit. |
+| Browser crash, transport/network failure, consecutive contact failures | Close that browser session, report `backoff`, wait 60/120/240 seconds up to the configured maximum, then start a fresh session. |
+| Crash or timeout during a possible send | Keep the journal entry as `unknown`, hold that recipient, reserve quota, and process unrelated contacts. No automatic resend or new follow-up to that recipient. |
+| Login, verification, invitation/account limit | Stop with `blocked` status for manual attention. No automatic challenge or limit bypass. |
+| Invalid configuration, damaged/unwritable database, unexpected programming error | Stop with an explicit failure; these need repair rather than repeated send attempts. |
+
+Repeated errors open a circuit breaker so a changed layout does not immediately run through the CSV. `status` shows whether the worker is working, waiting, outside working hours, recovering, blocked or failed, along with the retry time and error when relevant. Private `.local/worker-status.json` contains the same health information. Stop requests interrupt cooldown waits.
+
+The watcher can recover a browser failure while its Python process is alive. It is not an OS service: reboot, process termination or sleep requires the documented local start/resume workflow. Live layouts and account behavior still need ongoing validation; passing fixtures is not an assurance of unattended compatibility with every LinkedIn variant.
 
 ## Commands and troubleshooting
 
@@ -159,14 +180,14 @@ linkedin-outreach stop 1                  # Stop one person's sequence, with wor
 - **No new invites:** check the total campaign cap, daily/weekly caps, company filter, working window and existing Pending/connected state.
 - **Login/verification required:** complete `login` manually. There is no automated challenge bypass.
 - **Identity mismatch before an action:** that person is held for review and verified profiles continue. Check `status` and review their CSV identity; the app does not guess that abbreviated names identify the same person.
-- **Unexpected UI, login or verification issue:** the worker stops. Inspect the exact profile or complete login; website selector updates may be necessary.
+- **Unexpected UI or temporary browser failure:** check `status` for a held contact or automatic recovery time. Repeated layout failures may require an adapter update; do not remove send history to force retries.
 - **Uncertain send:** inspect LinkedIn before resolving it, as described below.
 
 Logs are in `.local/outreach.log` with rotation, plus `watch-output.log` and `watch-error.log` for detached runs. Logs, screenshots and CSV reports can contain contact data. Redact them before sharing. This app has no hosted backend or telemetry; normal browser traffic goes to LinkedIn. Files inside cloud-synced folders follow that folder's sync settings. Prefer a local, unsynced campaign-state directory for database reliability.
 
 ### Resolve an uncertain send
 
-The script commits a journal entry **before** sending. If it crashes or cannot verify the outcome, live runs stop rather than risk sending a duplicate. With the worker stopped, check LinkedIn manually, then choose exactly one outcome:
+The script commits a journal entry **before** sending. If it crashes or cannot verify the outcome, that recipient is held and the attempt counts toward limits. Unrelated contacts continue; the uncertain recipient is never automatically retried. With the worker stopped, check LinkedIn manually, then choose exactly one outcome:
 
 ```bash
 linkedin-outreach reconcile LEAD_ID sent

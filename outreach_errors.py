@@ -2,14 +2,30 @@
 
 
 class StopRun(RuntimeError):
-    """Stop without guessing or retrying a possible send."""
+    """Fatal run error unless a specific subclass defines narrower recovery."""
 
 
 class StopRequested(StopRun):
     """Operator requested normal shutdown."""
 
 
-class ProfileNeedsReview(StopRun):
+class AccountBlocked(StopRun):
+    """Login, verification or a platform limit requires operator attention."""
+
+
+class ContactNeedsReview(StopRun):
+    """Hold this contact without stopping unrelated contacts."""
+
+
+class ContactNotReady(StopRun):
+    """A read-only page operation may recover after a bounded retry."""
+
+
+class RetryCycle(StopRun):
+    """Discard this browser session and resume after a cooldown."""
+
+
+class ProfileNeedsReview(ContactNeedsReview):
     """A selected profile's identity cannot be verified before starting an action."""
 
 

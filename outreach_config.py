@@ -17,6 +17,8 @@ DEFAULTS = {
     "invitations_per_7_days": 5, "messages_per_run": 5, "messages_per_day": 10,
     "acceptance_checks_per_run": 20, "check_interval_minutes": 60,
     "watch_interval_minutes": 30, "minimum_seconds_between_sends": 60,
+    "read_attempts": 2, "contact_retry_limit": 3, "max_consecutive_failures": 3,
+    "retry_initial_seconds": 60, "retry_max_seconds": 1800,
     "message_1_delay_days": 1, "message_2_delay_days": 3,
     "working_days": [0, 1, 2, 3, 4], "working_hours": [9, 18], "company_filter": "",
     "connection_note": "Hi {first_name}, I'm looking to expand my network of engineering leaders in and around {location}. Would love to connect!",
@@ -29,6 +31,8 @@ POSITIVE_INTS = (
     "invitations_per_7_days", "messages_per_run", "messages_per_day",
     "acceptance_checks_per_run", "check_interval_minutes", "watch_interval_minutes",
     "minimum_seconds_between_sends", "message_1_delay_days", "message_2_delay_days",
+    "read_attempts", "contact_retry_limit", "max_consecutive_failures",
+    "retry_initial_seconds", "retry_max_seconds",
 )
 ALIASES = {"firstname": "first_name", "companyname": "company", "location": "location",
            "first_name": "first_name", "company": "company"}
@@ -86,6 +90,10 @@ def load_settings(path=None):
         if type(cfg[key]) is not int or cfg[key] < 1:
             raise ValueError(f"{key} must be a positive integer")
     total = cfg["campaign_invitation_limit"]
+    if cfg["retry_initial_seconds"] > cfg["retry_max_seconds"]:
+        raise ValueError("retry_initial_seconds must not exceed retry_max_seconds")
+    if cfg["read_attempts"] > 5:
+        raise ValueError("read_attempts must not exceed 5")
     if total is not None and (type(total) is not int or total < 1):
         raise ValueError("campaign_invitation_limit must be a positive integer or null for no total cap")
     if cfg["browser_channel"] not in ("brave", "msedge", "chrome", "chromium"):

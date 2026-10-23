@@ -15,9 +15,11 @@ import sys
 import tempfile
 import time
 from zoneinfo import ZoneInfo
+from playwright.sync_api import Error as BrowserError
 
 from outreach_config import VERSION, load_settings, read_json, resolve_path, state_path
-from outreach_errors import InvitationHeld, ProfileNeedsReview, StopRequested, StopRun
+from outreach_errors import (AccountBlocked, ContactNeedsReview, ContactNotReady, InvitationHeld,
+                             RetryCycle, StopRequested, StopRun)
 
 from lead_data import (SOURCE_DATA_REASON, SOURCE_DATA_REASONS, canonical_profile,
                        name_parts, read_clean_csv)
@@ -87,6 +89,10 @@ class Store:
                 detail TEXT NOT NULL DEFAULT '', UNIQUE(lead_id, kind)
             );
         """)
+        columns = {row['name'] for row in self.db.execute('PRAGMA table_info(leads)')}
+        if 'failure_count' not in columns:
+            self.db.execute('ALTER TABLE leads ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0')
+            self.db.commit()
 
     def close(self):
         self.db.close()
@@ -96,7 +102,7 @@ class Store:
 
     def update(self, lead_id, **values):
         allowed = {"state", "reason", "invited_at", "accepted_at", "message_1_at",
-                   "message_2_at", "last_checked_at", "next_check_at"}
+                   "message_2_at", "last_checked_at", "next_check_at", "failure_count"}
         if not values or not set(values) <= allowed:
             raise ValueError("Invalid lead update")
         with self.db:
@@ -144,8 +150,11 @@ class Store:
         return {"added": added, "duplicates": duplicate, "invalid_urls": invalid,
                 "updated": updated, "restored": restored}
 
-    def candidates(self, company=""):
+    def candidates(self, company="", now=None, include_deferred=False):
         sql, args = "SELECT * FROM leads WHERE state='new'", []
+        if not include_deferred:
+            sql += " AND (next_check_at IS NULL OR next_check_at<=?)"
+            args.append(stamp(now or utcnow()))
         if company:
             sql += " AND lower(company)=lower(?)"
             args.append(company)
@@ -161,6 +170,8 @@ class Store:
     def begin(self, lead_id, kind, message, now):
         # Commit BEFORE clicking anything that might send. A crash never retries it.
         with self.db:
+            if self.db.execute("SELECT 1 FROM actions WHERE lead_id=? AND status IN ('prepared','unknown')", (lead_id,)).fetchone():
+                raise ValueError('This contact has an unresolved send; reconcile it before another action')
             self.db.execute("""
                 INSERT INTO actions (lead_id,kind,status,started_at,message)
                 VALUES (?,?,'prepared',?,?)
@@ -211,7 +222,16 @@ class Store:
         for row in rows:
             self.uncertain(row["lead_id"], row["kind"],
                            "Previous run stopped during a send. Check LinkedIn before reconciling.")
+        with self.db:
+            self.db.execute("""UPDATE leads SET state='needs_review',reason=(
+                SELECT detail FROM actions WHERE lead_id=leads.id AND status='unknown' ORDER BY id DESC LIMIT 1)
+                WHERE id IN (SELECT lead_id FROM actions WHERE status='unknown')""")
         return len(rows)
+
+    def next_retry(self):
+        value = self.db.execute("""SELECT min(next_check_at) FROM leads
+            WHERE state IN ('new','invited','accepted','message_1_sent') AND next_check_at IS NOT NULL""").fetchone()[0]
+        return parsed(value)
 
     def unresolved(self):
         return self.db.execute("SELECT count(*) FROM actions WHERE status IN ('prepared','unknown')").fetchone()[0]
@@ -290,107 +310,159 @@ class Campaign:
         self.store, self.cfg, self.browser = store, cfg, browser
         self.now, self.pause = now, pause
         self.stop_requested = stop_requested or (lambda: False)
+        self.consecutive_failures = 0
 
     def check_stop(self):
         if self.stop_requested():
             raise StopRequested("Stop requested. Progress is saved.")
 
+    def failed(self, lead, detail, *, temporary=False):
+        count = self.store.lead(lead['id'])['failure_count'] + 1
+        values = dict(reason=detail, failure_count=count)
+        if temporary and count < self.cfg['contact_retry_limit']:
+            from outreach_worker import retry_delay
+            values['next_check_at'] = stamp(self.now() + timedelta(seconds=retry_delay(self.cfg, count)))
+            LOG.warning('DEFERRED #%s %s until %s: %s', lead['id'], lead['full_name'], values['next_check_at'], detail)
+        else:
+            values.update(state='needs_review', next_check_at=None)
+            LOG.warning('HELD #%s %s; other contacts can continue: %s', lead['id'], lead['full_name'], detail)
+        self.store.update(lead['id'], **values)
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= self.cfg['max_consecutive_failures']:
+            raise RetryCycle('Consecutive contact failures; cooling down before a fresh browser session')
+
+    def succeeded(self, lead):
+        self.consecutive_failures = 0
+        self.store.update(lead['id'], failure_count=0, reason='')
+
+    def read(self, lead, operation):
+        # Only read-only navigation/history is retried. Send methods never enter here.
+        for attempt in range(self.cfg['read_attempts']):
+            self.check_stop()
+            try:
+                return operation()
+            except ContactNeedsReview as exc:
+                self.failed(lead, str(exc))
+                return None
+            except (ContactNotReady, BrowserError, TimeoutError, ConnectionError) as exc:
+                text = str(exc)
+                if any(token in text.casefold() for token in ('browser has been closed', 'target page, context or browser has been closed',
+                                                              'connection closed', 'net::err_internet_disconnected',
+                                                              'net::err_name_not_resolved', 'net::err_network_changed',
+                                                              'net::err_connection_reset', 'net::err_connection_refused',
+                                                              'net::err_proxy_connection_failed', 'net::err_address_unreachable')):
+                    raise RetryCycle(text) from exc
+                if attempt + 1 < self.cfg['read_attempts']:
+                    LOG.warning('Read retry #%s for %s: %s', attempt + 1, lead['full_name'], text)
+                    self.pause(min(2 ** attempt, 5))
+                else:
+                    self.failed(lead, text, temporary=True)
+        return None
+
     def send(self, lead, kind):
         self.check_stop()
         last = self.store.last_send()
         if last:
-            remaining = self.cfg["minimum_seconds_between_sends"] - (self.now() - last).total_seconds()
+            remaining = self.cfg['minimum_seconds_between_sends'] - (self.now() - last).total_seconds()
             if remaining > 0:
                 self.pause(remaining)
         self.check_stop()
         message = render(lead, self.cfg)[kind]
-        self.store.begin(lead["id"], kind, message, self.now())
+        self.store.begin(lead['id'], kind, message, self.now())
         try:
-            if kind == "invite":
+            if kind == 'invite':
                 self.browser.send_invitation(lead, message)
             else:
-                self.browser.send_message(lead, message, self.store.sent_messages(lead["id"]))
-            self.store.sent(lead["id"], kind, self.now())
+                self.browser.send_message(lead, message, self.store.sent_messages(lead['id']))
+            self.store.sent(lead['id'], kind, self.now())
         except InvitationHeld as exc:
-            if kind != "invite":
-                self.store.uncertain(lead["id"], kind, str(exc))
-                raise StopRun("Unexpected invitation error during a message; check the send outcome.") from exc
-            self.store.hold_invitation(lead["id"], str(exc))
-            LOG.warning("HELD %s; invitation attempt counts toward limits, no automatic retry: %s", lead["full_name"], exc)
+            if kind != 'invite':
+                self.store.uncertain(lead['id'], kind, str(exc))
+            else:
+                self.store.hold_invitation(lead['id'], str(exc))
+            self.failed(lead, str(exc))
+            return False
+        except (AccountBlocked, StopRequested, KeyboardInterrupt, SystemExit) as exc:
+            self.store.uncertain(lead['id'], kind, str(exc) or type(exc).__name__)
+            raise
+        except (ContactNeedsReview, ContactNotReady, StopRun, BrowserError, TimeoutError, ConnectionError) as exc:
+            self.store.uncertain(lead['id'], kind, str(exc) or type(exc).__name__)
+            self.failed(lead, 'Send outcome unknown; never automatically retry: ' + str(exc))
             return False
         except BaseException as exc:
-            self.store.uncertain(lead["id"], kind, str(exc) or type(exc).__name__)
-            raise StopRun("Send outcome needs review; nothing will be retried automatically.") from exc
-        LOG.info("SENT %s to %s at %s", kind, lead["full_name"], lead["company"])
+            self.store.uncertain(lead['id'], kind, str(exc) or type(exc).__name__)
+            raise
+        self.succeeded(lead)
+        LOG.info('SENT %s to %s at %s', kind, lead['full_name'], lead['company'])
         return True
 
     def run(self):
         self.store.recover()
-        if self.store.unresolved():
-            raise StopRun("There is an uncertain send. Use status, check LinkedIn, then reconcile it.")
-        messages = 0
-        for lead in self.store.active_due(self.now(), self.cfg["acceptance_checks_per_run"]):
-            self.check_stop()
-            try:
-                state = self.browser.open_profile(lead)
-            except ProfileNeedsReview as exc:
-                self.store.update(lead["id"], state="needs_review", reason=str(exc))
-                LOG.warning("HELD %s for identity review; other profiles can continue: %s", lead["full_name"], exc)
+        messages = message_attempts = 0
+        for lead in self.store.active_due(self.now(), self.cfg['acceptance_checks_per_run']):
+            state = self.read(lead, lambda: self.browser.open_profile(lead))
+            if state is None:
                 continue
-            next_check = stamp(self.now() + timedelta(minutes=self.cfg["check_interval_minutes"]))
-            self.store.update(lead["id"], last_checked_at=stamp(self.now()), next_check_at=next_check)
-            if lead["state"] == "invited" and state == "pending":
+            next_check = stamp(self.now() + timedelta(minutes=self.cfg['check_interval_minutes']))
+            self.store.update(lead['id'], last_checked_at=stamp(self.now()), next_check_at=next_check)
+            if lead['state'] == 'invited' and state == 'pending':
+                self.succeeded(lead)
                 continue
-            if state != "connected":
-                self.store.update(lead["id"], state="needs_review", reason="Tracked connection is no longer connected/pending")
+            if state != 'connected':
+                self.failed(lead, 'Tracked connection is no longer connected/pending')
                 continue
-            history = self.browser.conversation(lead, self.store.sent_messages(lead["id"]))
+            history = self.read(lead, lambda: self.browser.conversation(lead, self.store.sent_messages(lead['id'])))
+            if history is None:
+                continue
             if history.inbound:
-                self.store.update(lead["id"], state="replied", reason="Recipient has sent a message; sequence stopped")
-                LOG.info("REPLIED: %s; follow-ups stopped", lead["full_name"])
+                self.store.update(lead['id'], state='replied', reason='Recipient has sent a message; sequence stopped', failure_count=0)
+                self.consecutive_failures = 0
+                LOG.info('REPLIED: %s; follow-ups stopped', lead['full_name'])
                 continue
             if history.unknown:
-                raise StopRun("Conversation sender/history could not be verified. No message sent.")
-            if lead["state"] == "invited":
-                self.store.update(lead["id"], state="accepted", accepted_at=stamp(self.now()))
-                LOG.info("ACCEPTED: %s; message 1 due in %s day(s)", lead["full_name"], self.cfg["message_1_delay_days"])
-                lead = self.store.lead(lead["id"])
+                self.failed(lead, 'Conversation sender/history could not be verified; no message sent')
+                continue
+            if lead['state'] == 'invited':
+                self.store.update(lead['id'], state='accepted', accepted_at=stamp(self.now()))
+                LOG.info('ACCEPTED: %s; message 1 due in %s day(s)', lead['full_name'], self.cfg['message_1_delay_days'])
+                lead = self.store.lead(lead['id'])
             action = due_message(lead, self.cfg, self.now())
-            if action and messages < self.cfg["messages_per_run"]:
-                if self.store.used("message", day_start(self.now(), self.cfg)) < self.cfg["messages_per_day"]:
-                    self.send(lead, action)
+            if (action and message_attempts < self.cfg['messages_per_run'] and
+                    self.store.used('message', day_start(self.now(), self.cfg)) < self.cfg['messages_per_day']):
+                message_attempts += 1
+                if self.send(lead, action):
                     messages += 1
+            else:
+                self.succeeded(lead)
 
-        sent = checked = 0
+        sent = checked = attempts = 0
         capacity = invite_capacity(self.store, self.cfg, self.now())
-        for lead in self.store.candidates(self.cfg.get("company_filter", "")):
+        for lead in self.store.candidates(self.cfg.get('company_filter', ''), self.now()):
             self.check_stop()
-            if sent >= capacity or checked >= self.cfg["acceptance_checks_per_run"]:
+            if (attempts >= capacity or invite_capacity(self.store, self.cfg, self.now()) <= 0 or
+                    checked >= self.cfg['acceptance_checks_per_run']):
                 break
             checked += 1
             try:
                 render(lead, self.cfg)
             except ValueError as exc:
-                self.store.update(lead["id"], state="needs_review", reason=str(exc))
+                self.failed(lead, str(exc))
                 continue
-            try:
-                state = self.browser.open_profile(lead)
-            except ProfileNeedsReview as exc:
-                self.store.update(lead["id"], state="needs_review", reason=str(exc))
-                LOG.warning("HELD %s for identity review; no invitation sent: %s", lead["full_name"], exc)
+            state = self.read(lead, lambda: self.browser.open_profile(lead))
+            if state is None:
                 continue
-            if state in ("pending", "connected", "unavailable"):
-                self.store.update(lead["id"], state="skipped", reason="Already " + state + "; not enrolled in this sequence")
-                LOG.info("SKIPPED %s: %s", lead["full_name"], state)
+            if state in ('pending', 'connected', 'unavailable'):
+                self.store.update(lead['id'], state='skipped', reason='Already ' + state + '; not enrolled in this sequence', failure_count=0)
+                self.consecutive_failures = 0
+                LOG.info('SKIPPED %s: %s', lead['full_name'], state)
                 continue
-            if state != "new":
-                raise StopRun("Profile state is ambiguous; no invitation sent")
-            if self.send(lead, "invite"):
+            if state != 'new':
+                self.failed(lead, 'Profile state is ambiguous; no invitation sent')
+                continue
+            attempts += 1
+            if self.send(lead, 'invite'):
                 sent += 1
-            else:
-                # The held attempt uses one slot even though no send was confirmed.
-                capacity -= 1
-        return {"invitations_sent": sent, "messages_sent": messages, "new_profiles_checked": checked}
+        return {'invitations_sent': sent, 'messages_sent': messages, 'new_profiles_checked': checked}
 
 
 class ProcessLock:
@@ -443,7 +515,7 @@ def campaign_finished(store, cfg):
     active = store.db.execute("SELECT count(*) FROM leads WHERE state IN ('invited','accepted','message_1_sent')").fetchone()[0]
     cap = cfg["campaign_invitation_limit"]
     cap_reached = cap is not None and store.used("invite") >= cap
-    return not active and (cap_reached or not store.candidates(cfg.get("company_filter", "")))
+    return not active and (cap_reached or not store.candidates(cfg.get("company_filter", ""), include_deferred=True))
 
 
 def wait_for_stop(path, seconds):
@@ -470,6 +542,13 @@ def browser_session(cfg, *, visible=False):
         executable = str(resolve_path(executable, Path(cfg["_workspace"])))
     return LinkedInBrowser(profile_directory(cfg["browser_channel"], cfg["_workspace"], cfg["browser_profile_directory"]),
                            cfg["browser_channel"], headless=False if visible else cfg["headless"], executable_path=executable)
+
+
+def browser_cycle(store, cfg, stop_path):
+    with browser_session(cfg) as browser:
+        browser.require_login()
+        return Campaign(store, cfg, browser, pause=lambda seconds: wait_for_stop(stop_path, seconds),
+                        stop_requested=stop_path.exists).run()
 
 
 def main(argv=None):
@@ -533,11 +612,23 @@ def main(argv=None):
         stop_path = directory / "stop-watch.request"
         if args.command == "status":
             print("Worker:", "running" if worker_running(directory) else "stopped")
+            health = directory / 'worker-status.json'
+            if health.is_file():
+                try:
+                    info = read_json(health)
+                    print('Worker phase:', info.get('phase', 'unknown'))
+                    if info.get('last_error'):
+                        print('Last error:', info['last_error'])
+                    if info.get('next_retry_at') and worker_running(directory):
+                        print('Next check/retry:', parsed(info['next_retry_at']).astimezone(ZoneInfo(cfg['timezone'])).isoformat(timespec='seconds'))
+                except (ValueError, OSError):
+                    print('Worker health details unavailable; see the private log')
             if not (directory / "outreach.sqlite3").is_file():
                 print("No campaign imported yet. Run preview first.")
                 return 0
             store = Store(directory / "outreach.sqlite3", readonly=True)
             show_status(store)
+            print('Held uncertain sends:', store.unresolved(), '(these contacts are never retried automatically)')
             print("Invitation capacity this run:", invite_capacity(store, cfg, utcnow()))
             return 0
         if args.command == "doctor":
@@ -593,49 +684,42 @@ def main(argv=None):
                         print(f"\n{kind} ({len(text)} characters):\n{text}")
             else:
                 if args.command == "watch":
-                    if store.unresolved():
-                        raise StopRun("An uncertain send needs reconciliation before starting the watcher")
+                    from outreach_worker import watch_worker
                     stop_path.unlink(missing_ok=True)
                     LOG.info("Watching weekdays/hours %s/%s, timezone %s; headless=%s. stop-watch requests shutdown.", cfg["working_days"], cfg["working_hours"], cfg["timezone"], cfg["headless"])
                     (directory / "watcher-ready.json").write_text(json.dumps({"pid": os.getpid(), "started_at": stamp(utcnow())}), encoding="utf-8")
                     watch_started = True
-                while True:
-                    if args.command == "watch" and (stop_path.exists() or campaign_finished(store, cfg)):
-                        LOG.info("Watcher stopped; campaign finished or stop requested. Progress is saved.")
-                        break
-                    needs_work = bool(store.active_due(utcnow(), 1)) or invite_capacity(store, cfg, utcnow()) > 0
-                    if args.command != "watch" or (working_time(utcnow(), cfg) and needs_work):
-                        with browser_session(cfg, visible=args.command == "inspect") as browser:
-                            browser.require_login()
-                            if args.command == "inspect":
-                                if args.lead_id is not None:
-                                    selected = store.lead(args.lead_id)
-                                    if selected is None:
-                                        raise ValueError("Unknown lead ID")
-                                    candidates = [selected]
-                                else:
-                                    candidates = store.candidates(cfg.get("company_filter", ""))
-                                if not candidates:
-                                    print("No eligible profiles")
-                                    break
-                                lead = candidates[0]
-                                try:
-                                    state = browser.open_profile(lead)
-                                except Exception:
-                                    browser.profile_diagnostic(lead, directory / "profile-diagnostic.json")
-                                    raise
-                                print(json.dumps({"lead_id": lead["id"], "name": lead["full_name"], "company": lead["company"], "profile_state": state}, indent=2))
-                                browser.profile_diagnostic(lead, directory / "profile-diagnostic.json")
-                                browser.screenshot(directory / "profile-inspection.png")
-                            else:
-                                print(json.dumps(Campaign(store, cfg, browser,
-                                                          pause=lambda seconds: wait_for_stop(stop_path, seconds) if args.command == "watch" else time.sleep(seconds),
-                                                          stop_requested=stop_path.exists if args.command == "watch" else None).run()), flush=True)
-                    if args.command != "watch":
-                        break
-                    if wait_for_stop(stop_path, cfg["watch_interval_minutes"] * 60):
-                        LOG.info("Watcher stopped at operator request. Progress is saved.")
-                        break
+                    watch_worker(cfg, directory, run_cycle=lambda: browser_cycle(store, cfg, stop_path),
+                                 has_work=lambda: bool(store.active_due(utcnow(), 1)) or (
+                                     invite_capacity(store, cfg, utcnow()) > 0 and bool(store.candidates(cfg.get('company_filter', '')))),
+                                 is_finished=lambda: campaign_finished(store, cfg), next_retry=store.next_retry,
+                                 now=utcnow, wait=lambda seconds: wait_for_stop(stop_path, seconds),
+                                 stop_requested=stop_path.exists)
+                    return 0
+                with browser_session(cfg, visible=args.command == 'inspect') as browser:
+                    browser.require_login()
+                    if args.command == 'inspect':
+                        if args.lead_id is not None:
+                            selected = store.lead(args.lead_id)
+                            if selected is None:
+                                raise ValueError('Unknown lead ID')
+                            candidates = [selected]
+                        else:
+                            candidates = store.candidates(cfg.get('company_filter', ''))
+                        if not candidates:
+                            print('No eligible profiles')
+                            return 0
+                        lead = candidates[0]
+                        try:
+                            state = browser.open_profile(lead)
+                        except Exception:
+                            browser.profile_diagnostic(lead, directory / 'profile-diagnostic.json')
+                            raise
+                        print(json.dumps({'lead_id': lead['id'], 'name': lead['full_name'], 'company': lead['company'], 'profile_state': state}, indent=2))
+                        browser.profile_diagnostic(lead, directory / 'profile-diagnostic.json')
+                        browser.screenshot(directory / 'profile-inspection.png')
+                    else:
+                        print(json.dumps(Campaign(store, cfg, browser).run()), flush=True)
         return 0
     except KeyboardInterrupt:
         print("Stopped. Progress is saved.")

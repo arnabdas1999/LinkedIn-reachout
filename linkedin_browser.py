@@ -16,7 +16,8 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 
 from playwright.sync_api import Error as BrowserError, TimeoutError as BrowserTimeoutError, sync_playwright
 
-from outreach_errors import InvitationFormMissing, InvitationHeld, ProfileNeedsReview, StopRun
+from outreach_errors import (AccountBlocked, ContactNeedsReview, ContactNotReady,
+                             InvitationFormMissing, InvitationHeld, ProfileNeedsReview, StopRun)
 from lead_data import canonical_profile
 
 
@@ -74,15 +75,22 @@ class LinkedInBrowser:
             self.page.set_default_timeout(10000)
             self.page.set_default_navigation_timeout(45000)
             return self
-        except BaseException:
+        except BaseException as exc:
             self.pw.stop()
+            if isinstance(exc, BrowserError) and "executable doesn't exist" in str(exc).casefold():
+                raise StopRun("Browser executable is missing. Run install-browser or correct browser_executable before starting.") from exc
             raise
 
-    def __exit__(self, *args):
+    def __exit__(self, exc_type, exc, traceback):
         try:
-            self.context.close()
-        finally:
-            self.pw.stop()
+            try:
+                self.context.close()
+            finally:
+                self.pw.stop()
+        except Exception:
+            # Cleanup must not replace an account block or an in-flight failure.
+            if exc is None:
+                raise
 
     def screenshot(self, path):
         self.page.screenshot(path=str(path), full_page=False)
@@ -117,13 +125,14 @@ class LinkedInBrowser:
             return visible[0]
         if not visible and optional:
             return None
-        raise StopRun(f"Expected one {description}; found {len(visible)}. UI needs inspection.")
+        error = ContactNeedsReview if visible else ContactNotReady
+        raise error(f"Expected one {description}; found {len(visible)}. UI needs inspection.")
 
     def guard(self, frame=None):
         surface = frame or self.page
         url = surface.url.casefold()
         if any(part in url for part in ("/checkpoint", "/challenge", "/authwall", "/login", "/uas/")):
-            raise StopRun("LinkedIn needs login or verification. Complete it manually with the login command.")
+            raise AccountBlocked("LinkedIn needs login or verification. Complete it manually with the login command.")
         body = surface.locator("body").inner_text(timeout=30000).casefold()
         blockers = (
             "you've reached the weekly invitation limit", "you have reached the weekly invitation limit",
@@ -135,7 +144,7 @@ class LinkedInBrowser:
             "unusual traffic", "let's do a quick security check", "you've reached your monthly limit",
         )
         if any(text in body for text in blockers):
-            raise StopRun("LinkedIn displayed a limit or verification notice. No further activity will run.")
+            raise AccountBlocked("LinkedIn displayed a limit or verification notice. No further activity will run.")
 
     def login(self):
         if self.headless:
@@ -207,7 +216,7 @@ class LinkedInBrowser:
         legacy = heading.locator("xpath=ancestor::section[1]")
         if legacy.count() == 1:
             return legacy
-        raise StopRun("Cannot isolate this profile's introduction and action controls")
+        raise ContactNeedsReview("Cannot isolate this profile's introduction and action controls")
 
     def button(self, root, pattern, description, optional=True):
         name = re.compile(pattern, re.I)
@@ -236,7 +245,7 @@ class LinkedInBrowser:
                 # Some profiles paint controls before attaching their handlers.
                 # Retry only the read-only menu opener, never Connect or Send.
                 if attempt or more.get_attribute("aria-expanded") == "true":
-                    raise StopRun("Profile More menu did not become readable; no invitation sent") from None
+                    raise ContactNotReady("Profile More menu did not become readable; no invitation sent") from None
         menu = self.one_visible(menus, "profile More menu")
         self.last_profile_menu = menu.evaluate("""root => ({text:root.innerText,
             controls:[...root.querySelectorAll('button,a,[role="menuitem"],[role="button"]')]
@@ -272,7 +281,7 @@ class LinkedInBrowser:
                 return "pending"
             if self.one_visible(menu.get_by_text(re.compile(r"^Remove connection(?: with .+)?$", re.I)), "Remove connection menu item", optional=True):
                 return "connected"
-            raise StopRun("Could not determine whether this profile is connected or pending")
+            raise ContactNeedsReview("Could not determine whether this profile is connected or pending")
         finally:
             self.page.keyboard.press("Escape")
 
@@ -288,7 +297,7 @@ class LinkedInBrowser:
         try:
             actual_url = canonical_profile(self.page.url)
         except ValueError:
-            raise StopRun("Profile navigation redirected to an unexpected URL") from None
+            raise ContactNeedsReview("Profile navigation redirected to an unexpected URL") from None
         if actual_url != lead["url"]:
             raise ProfileNeedsReview("Profile URL changed. Review this lead before sending anything")
         name = self.one_visible(self.profile_heading(), "profile name").inner_text()
@@ -313,7 +322,7 @@ class LinkedInBrowser:
                 dialog = self.one_visible(frame.get_by_role("dialog"), "invitation dialog", optional=True)
                 if dialog:
                     if is_preload and normalized(lead["full_name"]) not in normalized(dialog.inner_text()):
-                        raise StopRun("Embedded invitation names a different recipient; nothing was sent")
+                        raise ContactNeedsReview("Embedded invitation names a different recipient; nothing was sent")
                     return dialog, frame
                 if is_invite:
                     note = self.button(frame, r"^Add a note$", "Add a note button")
@@ -337,12 +346,12 @@ class LinkedInBrowser:
     def send_invitation(self, lead, message):
         self.guard()
         if self.profile_state() != "new":
-            raise StopRun("This profile is no longer eligible for a new invitation")
+            raise ContactNeedsReview("This profile is no longer eligible for a new invitation")
         connect = self.connect_button(self.topcard())
         if connect is None:
             connect = self.menu_connect(self.more_menu())
         if connect is None:
-            raise StopRun("Connect action is missing")
+            raise ContactNeedsReview("Connect action is missing")
         # This click itself can send on some LinkedIn UI variants. Journal is already committed.
         connect.click()
         try:
@@ -390,7 +399,7 @@ class LinkedInBrowser:
         # Read the profile again once; never click Send again to confirm success.
         if self.open_profile(lead) == "pending":
             return
-        raise StopRun("Clicked Send but could not verify Pending. Check LinkedIn; do not retry blindly")
+        raise ContactNeedsReview("Clicked Send but could not verify Pending. Check LinkedIn; do not retry blindly")
 
     def open_conversation(self, lead):
         for attempt in range(2):
@@ -410,7 +419,7 @@ class LinkedInBrowser:
                 # Only retry opening the conversation, never composing or sending.
                 if not panels and not attempt:
                     continue
-                raise StopRun(f"Expected one conversation panel; found {len(panels)}")
+                raise ContactNotReady(f"Expected one conversation panel; found {len(panels)}")
             panel, self.message_frame = panels[0]
             headers = panel.locator(".msg-overlay-bubble-header:visible, .msg-overlay-conversation-bubble-header:visible")
             headers.first.wait_for(state="visible")
@@ -424,7 +433,7 @@ class LinkedInBrowser:
             else:
                 self.guard(self.message_frame)
                 if attempt:
-                    raise StopRun("Conversation recipient does not match the selected profile")
+                    raise ContactNeedsReview("Conversation recipient does not match the selected profile")
                 # A previous thread can be restored after profile navigation.
                 # Close it without changing drafts, then select this profile again.
                 self.close_conversations()
@@ -434,7 +443,7 @@ class LinkedInBrowser:
         editors.first.wait_for(state="visible")
         editor = self.one_visible(editors, "message editor")
         if editor.inner_text().strip():
-            raise StopRun("Conversation has an unsent draft. Clear it manually")
+            raise ContactNeedsReview("Conversation has an unsent draft. Clear it manually")
         return panel, editor
 
     def history(self, panel, lead, known):
@@ -445,7 +454,7 @@ class LinkedInBrowser:
         if message_list is None:
             message_list = self.one_visible(panel.locator(".msg-s-message-list"), "message history", optional=True)
         if message_list is None:
-            raise StopRun("Cannot verify loaded message history")
+            raise ContactNotReady("Cannot verify loaded message history")
         # Wait for the rendered conversation to settle, not for arbitrary send timing.
         previous = None
         stable_since = None
@@ -462,7 +471,7 @@ class LinkedInBrowser:
                 previous, stable_since = text, None
             self.page.wait_for_timeout(250)
         else:
-            raise StopRun("Message history did not finish loading")
+            raise ContactNotReady("Message history did not finish loading")
         bodies = panel.locator(".msg-s-event-listitem__body")
         texts = [normalized(item.inner_text()) for item in bodies.all() if item.is_visible()]
         allowed = {normalized(text) for text in known.values()}
@@ -496,22 +505,22 @@ class LinkedInBrowser:
 
     def send_message(self, lead, message, known):
         if self.profile_state() != "connected":
-            raise StopRun("Recipient is no longer a first-degree connection")
+            raise ContactNeedsReview("Recipient is no longer a first-degree connection")
         panel, editor = self.open_conversation(lead)
         history = self.history(panel, lead, known)
         if history.inbound or history.unknown:
-            raise StopRun("Conversation changed or has a reply. Message was not sent")
+            raise ContactNeedsReview("Conversation changed or has a reply. Message was not sent")
         target = normalized(message)
         before = sum(normalized(item.inner_text()) == target for item in panel.locator(".msg-s-event-listitem__body").all())
         if before:
-            raise StopRun("This exact message already exists in the conversation")
+            raise ContactNeedsReview("This exact message already exists in the conversation")
         editor.fill(message)
         self.guard()
         # Recheck after composing, immediately before the mutating click.
         current = self.history(panel, lead, known)
         if current.inbound or current.unknown:
             editor.fill("")
-            raise StopRun("Conversation changed while composing. Message was not sent")
+            raise ContactNeedsReview("Conversation changed while composing. Message was not sent")
         send = self.button(panel, r"^Send(?: message)?$", "Send message button", optional=False)
         send.click()
         deadline = time.monotonic() + 15
@@ -521,4 +530,4 @@ class LinkedInBrowser:
             if count > before and not editor.inner_text().strip():
                 return
             self.page.wait_for_timeout(500)
-        raise StopRun("Clicked Send but could not verify the message. Check LinkedIn before reconciling")
+        raise ContactNeedsReview("Clicked Send but could not verify the message. Check LinkedIn before reconciling")

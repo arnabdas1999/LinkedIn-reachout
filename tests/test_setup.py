@@ -5,12 +5,14 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
+from playwright.sync_api import Error as BrowserError
 
 from lead_data import read_clean_csv
 from linkedin_browser import LinkedInBrowser
 from outreach import ProcessLock, StopRun, browser_session, main, profile_directory
 from outreach_config import load_settings, state_path, template
 from outreach_setup import prepare_source, worker_running
+from outreach_errors import AccountBlocked
 
 
 class SetupTests(unittest.TestCase):
@@ -75,6 +77,42 @@ class SetupTests(unittest.TestCase):
         for value in (0, -1, True, "unlimited"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 self.config(campaign_invitation_limit=value)
+
+    def test_retry_bounds_are_validated_before_worker_start(self):
+        for values in ({'read_attempts': 6}, {'contact_retry_limit': 0},
+                       {'retry_initial_seconds': 300, 'retry_max_seconds': 60}):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                self.config(**values)
+
+    def test_missing_browser_executable_is_actionable_instead_of_retried_forever(self):
+        fake = MagicMock()
+        fake.chromium.launch_persistent_context.side_effect = BrowserError("Executable doesn't exist at missing-browser")
+        with patch('linkedin_browser.sync_playwright') as factory:
+            factory.return_value.start.return_value = fake
+            with self.assertRaises(StopRun):
+                with LinkedInBrowser(self.root / 'profile'):
+                    pass
+        fake.stop.assert_called_once()
+
+    def test_browser_cleanup_error_does_not_hide_an_account_block(self):
+        adapter = LinkedInBrowser(self.root / 'profile')
+        adapter.context, adapter.pw = MagicMock(), MagicMock()
+        adapter.context.close.side_effect = BrowserError('Browser already closed')
+        with self.assertRaises(AccountBlocked):
+            try:
+                raise AccountBlocked('Weekly limit')
+            except AccountBlocked as error:
+                adapter.__exit__(type(error), error, error.__traceback__)
+                raise
+        adapter.pw.stop.assert_called_once()
+
+    def test_browser_cleanup_error_without_another_error_is_recoverable(self):
+        adapter = LinkedInBrowser(self.root / 'profile')
+        adapter.context, adapter.pw = MagicMock(), MagicMock()
+        adapter.context.close.side_effect = BrowserError('Browser transport lost')
+        with self.assertRaises(BrowserError):
+            adapter.__exit__(None, None, None)
+        adapter.pw.stop.assert_called_once()
 
     def test_background_start_requires_explicit_live_flag(self):
         self.config()
