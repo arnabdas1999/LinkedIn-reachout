@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 
 from playwright.sync_api import Error as BrowserError, TimeoutError as BrowserTimeoutError, sync_playwright
 
-from outreach_errors import ProfileNeedsReview, StopRun
+from outreach_errors import InvitationFormMissing, InvitationHeld, ProfileNeedsReview, StopRun
 from lead_data import canonical_profile
 
 
@@ -127,6 +127,7 @@ class LinkedInBrowser:
         body = surface.locator("body").inner_text(timeout=30000).casefold()
         blockers = (
             "you've reached the weekly invitation limit", "you have reached the weekly invitation limit",
+            "you've reached your weekly invitation limit", "you have reached your weekly invitation limit",
             "you've reached your invitation limit", "you have reached your invitation limit",
             "too many invitations", "no personalized invitations left", "no free personalized invitations left",
             "your account has been restricted", "your account is temporarily restricted",
@@ -331,7 +332,7 @@ class LinkedInBrowser:
         from outreach import ROOT
         (ROOT / ".local" / "invitation-diagnostic.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
         self.page.screenshot(path=str(ROOT / ".local" / "invitation-inspection.png"))
-        raise StopRun("Invitation form was not recognized. No Send action was clicked")
+        raise InvitationFormMissing("Invitation form was not recognized after Connect; no Send control was clicked")
 
     def send_invitation(self, lead, message):
         self.guard()
@@ -344,7 +345,20 @@ class LinkedInBrowser:
             raise StopRun("Connect action is missing")
         # This click itself can send on some LinkedIn UI variants. Journal is already committed.
         connect.click()
-        dialog, frame = self.invitation_dialog(lead)
+        try:
+            dialog, frame = self.invitation_dialog(lead)
+        except InvitationFormMissing as exc:
+            # Connect itself can send on some layouts. Never click it again.
+            # A fresh verified profile must still offer Connect before this can
+            # become a local hold. Pending/unknown outcomes remain global stops.
+            self.guard()
+            for pending_frame in self.page.frames:
+                parts = urlsplit(pending_frame.url)
+                if parts.hostname in ("www.linkedin.com", "linkedin.com") and parts.path.startswith("/preload"):
+                    self.guard(pending_frame)
+            if self.open_profile(lead) == "new":
+                raise InvitationHeld("Invitation form did not open; refreshed profile still offers Connect. Contact held without retry.") from exc
+            raise
         self.guard()
         self.guard(frame)
         note_fields = dialog.locator("textarea")

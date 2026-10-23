@@ -8,12 +8,13 @@ import os
 import re
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from playwright.sync_api import sync_playwright
 
 from linkedin_browser import LinkedInBrowser, brave_executable
 from outreach import StopRun
-from outreach_errors import ProfileNeedsReview
+from outreach_errors import InvitationFormMissing, InvitationHeld, ProfileNeedsReview
 
 URL = "https://www.linkedin.com/in/alex/"
 LEAD = {"id": 1, "url": URL, "first_name": "Alex", "full_name": "Alex Example", "company": "Oracle"}
@@ -132,6 +133,53 @@ class BrowserChecks(unittest.TestCase):
         self.adapter.send_invitation(LEAD, NOTE)
         self.assertEqual(self.page.evaluate("window.invitationText"), NOTE)
         self.assertEqual(self.page.evaluate("window.sends"), 1)
+
+    def test_missing_invitation_form_holds_only_after_fresh_profile_still_offers_connect(self):
+        self.fixture(transform=lambda html: html.replace("document.querySelector('dialog').showModal()", "console.log('connect-click')"))
+        clicks = []
+        self.page.on('console', lambda message: clicks.append(message.text) if message.text == 'connect-click' else None)
+        with patch.object(self.adapter, 'invitation_dialog', side_effect=InvitationFormMissing('No recognized form')):
+            with self.assertRaises(InvitationHeld):
+                self.adapter.send_invitation(LEAD, NOTE)
+        self.assertEqual(clicks, ['connect-click'])
+        self.assertGreaterEqual(self.requests.count(URL), 2)
+        self.assertEqual(self.adapter.profile_state(), 'new')
+        self.assertIsNone(self.page.evaluate('window.sends'))
+
+    def test_connect_that_sent_immediately_is_never_treated_as_an_unsent_hold(self):
+        self.fixture(transform=lambda html: html.replace("document.querySelector('dialog').showModal()", "console.log('connect-click');document.querySelector('#connect').outerHTML='<button>Pending</button>'"))
+        clicks = []
+        self.page.on('console', lambda message: clicks.append(message.text) if message.text == 'connect-click' else None)
+        pending_html = re.sub(r'<button id="connect"[^>]*>Connect</button>', '<button>Pending</button>', HTML.replace('DEGREE', '2nd').replace('EVENTS', ''))
+        self.page.route(URL, lambda route: route.fulfill(status=200, content_type='text/html', body=pending_html))
+        with patch.object(self.adapter, 'invitation_dialog', side_effect=InvitationFormMissing('No recognized form')):
+            with self.assertRaises(InvitationFormMissing):
+                self.adapter.send_invitation(LEAD, NOTE)
+        self.assertEqual(clicks, ['connect-click'])
+        self.assertEqual(self.adapter.profile_state(), 'pending')
+
+    def test_invitation_form_failure_does_not_bypass_account_limit_notice(self):
+        self.fixture(transform=lambda html: html.replace("document.querySelector('dialog').showModal()", "document.body.append(document.createTextNode('You have reached your weekly invitation limit'))"))
+        with patch.object(self.adapter, 'invitation_dialog', side_effect=InvitationFormMissing('No recognized form')):
+            with self.assertRaises(StopRun) as caught:
+                self.adapter.send_invitation(LEAD, NOTE)
+        self.assertNotIsInstance(caught.exception, InvitationHeld)
+        self.assertEqual(self.requests.count(URL), 1)
+        self.assertIsNone(self.page.evaluate('window.sends'))
+
+    def test_invitation_form_failure_in_frame_does_not_bypass_account_limit_notice(self):
+        self.fixture(transform=lambda html: html.replace("document.querySelector('dialog').showModal()",
+                     "const f=document.createElement('iframe');f.src='/preload/';document.body.append(f)"),
+                     frame_html='<html><body>You have reached your weekly invitation limit</body></html>')
+        def missing_form(lead):
+            self.page.frame_locator('iframe').locator('body').wait_for(state='visible')
+            raise InvitationFormMissing('No recognized form')
+        with patch.object(self.adapter, 'invitation_dialog', side_effect=missing_form):
+            with self.assertRaises(StopRun) as caught:
+                self.adapter.send_invitation(LEAD, NOTE)
+        self.assertNotIsInstance(caught.exception, InvitationHeld)
+        self.assertEqual(self.requests.count(URL), 1)
+        self.assertIsNone(self.page.evaluate('window.sends'))
 
     def test_pending_link_with_long_accessible_label_confirms_success(self):
         def pending_link(html):

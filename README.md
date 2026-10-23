@@ -12,6 +12,7 @@ A local Python app that reads your contacts CSV, personalizes your message templ
 - Supports your connection note, a message after acceptance, and a later follow-up.
 - Stops a person's sequence when a reply or an unrecognized/manual message appears.
 - Journals sends before clicking, prevents parallel workers, and never blindly retries an uncertain send.
+- If an invitation form fails to open and a refreshed, identity-verified profile still offers Connect, holds that contact and continues with others. The held attempt counts toward invitation limits and is never retried automatically. Uncertain sends and account limits still stop the worker.
 - Provides an offline preview, setup diagnostics, background start/stop, progress and rotating logs.
 
 ## Requirements

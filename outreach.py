@@ -17,7 +17,7 @@ import time
 from zoneinfo import ZoneInfo
 
 from outreach_config import VERSION, load_settings, read_json, resolve_path, state_path
-from outreach_errors import ProfileNeedsReview, StopRequested, StopRun
+from outreach_errors import InvitationHeld, ProfileNeedsReview, StopRequested, StopRun
 
 from lead_data import (SOURCE_DATA_REASON, SOURCE_DATA_REASONS, canonical_profile,
                        name_parts, read_clean_csv)
@@ -193,6 +193,19 @@ class Store:
             self.db.execute("UPDATE leads SET state='needs_review',reason=? WHERE id=?",
                             (detail, lead_id))
 
+    def hold_invitation(self, lead_id, detail):
+        # Keep the attempt in the journal and quota, without requeueing it.
+        # Only a freshly verified profile still offering Connect qualifies.
+        with self.db:
+            cursor = self.db.execute("""
+                UPDATE actions SET status='cancelled',detail=?
+                WHERE lead_id=? AND kind='invite' AND status='prepared'
+            """, (detail, lead_id))
+            if cursor.rowcount != 1:
+                raise ValueError("No prepared invitation to hold")
+            self.db.execute("UPDATE leads SET state='needs_review',reason=? WHERE id=?",
+                            (detail, lead_id))
+
     def recover(self):
         rows = self.db.execute("SELECT * FROM actions WHERE status='prepared'").fetchall()
         for row in rows:
@@ -298,10 +311,18 @@ class Campaign:
             else:
                 self.browser.send_message(lead, message, self.store.sent_messages(lead["id"]))
             self.store.sent(lead["id"], kind, self.now())
+        except InvitationHeld as exc:
+            if kind != "invite":
+                self.store.uncertain(lead["id"], kind, str(exc))
+                raise StopRun("Unexpected invitation error during a message; check the send outcome.") from exc
+            self.store.hold_invitation(lead["id"], str(exc))
+            LOG.warning("HELD %s; invitation attempt counts toward limits, no automatic retry: %s", lead["full_name"], exc)
+            return False
         except BaseException as exc:
             self.store.uncertain(lead["id"], kind, str(exc) or type(exc).__name__)
             raise StopRun("Send outcome needs review; nothing will be retried automatically.") from exc
         LOG.info("SENT %s to %s at %s", kind, lead["full_name"], lead["company"])
+        return True
 
     def run(self):
         self.store.recover()
@@ -364,8 +385,11 @@ class Campaign:
                 continue
             if state != "new":
                 raise StopRun("Profile state is ambiguous; no invitation sent")
-            self.send(lead, "invite")
-            sent += 1
+            if self.send(lead, "invite"):
+                sent += 1
+            else:
+                # The held attempt uses one slot even though no send was confirmed.
+                capacity -= 1
         return {"invitations_sent": sent, "messages_sent": messages, "new_profiles_checked": checked}
 
 

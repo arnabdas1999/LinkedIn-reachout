@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from outreach import Campaign, Store, StopRequested, StopRun, campaign_finished, canonical_profile, day_start, due_message, invite_capacity, load_settings, render, stamp, working_time
-from outreach_errors import ProfileNeedsReview
+from outreach_errors import InvitationHeld, ProfileNeedsReview
 
 NOW = datetime(2026, 10, 21, 16, 0, tzinfo=timezone.utc)
 ROOT = Path(__file__).resolve().parents[1]
@@ -247,6 +247,40 @@ class OutreachTests(unittest.TestCase):
             self.campaign(browser).run()
         self.assertEqual(self.store.unresolved(), 1)
         self.assertEqual(self.store.lead(2)["state"], "new")
+
+    def test_verified_invitation_hold_continues_without_exceeding_limits(self):
+        self.add_lead("next")
+        self.add_lead("over-limit")
+        self.cfg.update(campaign_invitation_limit=None, invitations_per_run=2, invitations_per_day=2)
+        browser = FakeBrowser()
+        original_send = browser.send_invitation
+        def send_invitation(lead, message):
+            if lead['id'] == 1:
+                raise InvitationHeld("Refreshed profile still offers Connect")
+            original_send(lead, message)
+        browser.send_invitation = send_invitation
+        result = self.campaign(browser).run()
+        self.assertEqual(result['invitations_sent'], 1)
+        self.assertEqual(self.store.lead(1)['state'], 'needs_review')
+        self.assertIsNone(self.store.lead(1)['invited_at'])
+        self.assertEqual(self.store.lead(2)['state'], 'invited')
+        self.assertEqual(self.store.lead(3)['state'], 'new')
+        self.assertEqual(self.store.unresolved(), 0)
+        self.assertEqual(self.store.used('invite'), 2)
+        self.assertEqual(invite_capacity(self.store, self.cfg, NOW), 0)
+        self.store.close()
+        self.store = Store(self.path)
+        self.campaign(browser, NOW + timedelta(days=1)).run()
+        self.assertEqual([item[0] for item in browser.sends], [2, 3])
+        self.assertEqual(self.store.lead(1)['state'], 'needs_review')
+
+    def test_invitation_hold_cannot_clear_a_preexisting_uncertain_send(self):
+        self.store.begin(1, 'invite', 'hello', NOW)
+        self.store.uncertain(1, 'invite', 'Outcome unknown')
+        with self.assertRaises(ValueError):
+            self.store.hold_invitation(1, 'Unverified attempt to clear it')
+        self.assertEqual(self.store.unresolved(), 1)
+        self.assertEqual(self.store.lead(1)['reason'], 'Outcome unknown')
 
     def test_followup_clock_starts_when_acceptance_is_observed(self):
         self.invite(NOW - timedelta(days=10))
