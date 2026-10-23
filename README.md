@@ -80,6 +80,8 @@ linkedin-outreach init --csv /path/to/contacts.csv --messages /path/to/messages.
 
 Omit `--messages` to create starter templates. `init` refuses to overwrite existing settings or messages. Linux may need `python -m playwright install --with-deps chromium`; this can request OS package-manager privileges. Chrome, Edge and Brave must be installed separately. `install-browser` only downloads bundled Chromium when selected.
 
+On Ubuntu 23.10+, AppArmor can also prevent downloaded Chromium from using its sandbox. An administrator can allow the specific browser binaries to use user namespaces, as described in [Chromium's AppArmor guidance](https://chromium.googlesource.com/chromium/src/+/main/docs/security/apparmor-userns-restrictions.md). CI configures that permission only for the ephemeral runner's Playwright cache.
+
 ## CSV format
 
 Supply your own contacts CSV. A minimal header is `Full Name,Company,LinkedIn Profile`; add the optional fields below as needed. Required information:

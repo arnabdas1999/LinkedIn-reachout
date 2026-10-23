@@ -18,7 +18,7 @@ from outreach_errors import AccountBlocked
 class SetupTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         self.csv = self.root / "my contacts.csv"
         self.csv.write_text("name,company_name,city,linkedin_url\nMorgan Sample,Example Company,Boston,https://linkedin.com/in/morgan-example/\n", encoding="utf-8")
         self.settings = self.root / "settings.json"

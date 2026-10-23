@@ -17,7 +17,7 @@ from test_outreach import FakeBrowser, NOW, OutreachCase
 class OperationsTests(OutreachCase):
     def setUp(self):
         super().setUp()
-        self.folder = Path(self.tmp.name)
+        self.folder = Path(self.tmp.name).resolve()
         self.cfg.update(desktop_notifications=False, state_directory=str(self.folder))
 
     def test_backup_restores_exact_journal_but_sending_requires_audit(self):

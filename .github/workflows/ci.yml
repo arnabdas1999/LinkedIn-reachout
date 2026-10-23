@@ -28,6 +28,24 @@ jobs:
       - run: python -m ruff check .
       - run: python -m unittest discover -s tests -v
       - run: python -m playwright install --with-deps chromium
+      # Ubuntu restricts user namespaces for downloaded Chromium binaries.
+      # Allow only this ephemeral runner's Playwright cache; keep Chromium's
+      # sandbox enabled. See Chromium's AppArmor userns documentation.
+      - name: Allow Chromium namespaces on Ubuntu runner
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cat <<EOF | sudo tee /etc/apparmor.d/outreach-playwright
+          abi <abi/4.0>,
+          include <tunables/global>
+          profile outreach-playwright ${HOME}/.cache/ms-playwright/**/chrome flags=(unconfined) {
+            userns,
+          }
+          profile outreach-playwright-headless ${HOME}/.cache/ms-playwright/**/chrome-headless-shell flags=(unconfined) {
+            userns,
+          }
+          EOF
+          sudo apparmor_parser -r /etc/apparmor.d/outreach-playwright
       - run: python -m unittest discover -s tests -p browser_checks.py -v
       - run: python -m build
       - run: python scripts/check_release.py --dist

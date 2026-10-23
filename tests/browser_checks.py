@@ -79,7 +79,11 @@ class BrowserChecks(unittest.TestCase):
                 options["executable_path"] = brave_executable()
             except StopRun:
                 pass
-        cls.browser = cls.pw.chromium.launch(**options)
+        try:
+            cls.browser = cls.pw.chromium.launch(**options)
+        except BaseException:
+            cls.pw.stop()
+            raise
 
     @classmethod
     def tearDownClass(cls):
