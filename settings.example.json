@@ -41,5 +41,10 @@
   "desktop_notifications": true,
   "notification_cooldown_minutes": 30,
   "backup_interval_hours": 24,
-  "backup_retention": 14
+  "backup_retention": 14,
+  "automatic_review": true,
+  "review_checks_per_run": 5,
+  "review_retry_limit": 3,
+  "review_interval_minutes": 60,
+  "automatic_resume_limit": 3
 }

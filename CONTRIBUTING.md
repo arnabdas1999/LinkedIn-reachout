@@ -8,4 +8,6 @@ Add regression coverage for changed send, scheduling, recipient verification, re
 
 Do not add stealth settings, CAPTCHA bypasses, proxy/account rotation or private LinkedIn endpoints. An ambiguous send must remain blocked until explicitly reconciled. Never change saved timestamps or action history while normalizing source data.
 
+Automatic review lives in `outreach_review.py`. Review observations may confirm a positive outcome, but absence alone must never authorize a resend. The no-dispatch guard is versioned; legacy NULL markers do not establish that a click never happened. Archive any automatically released reservation, retain its original quota timing on positive confirmation, and cover inbound copies, drafts, identity repairs and exhausted-review behavior with regression tests.
+
 For bug reports include OS, Python/app/browser versions, the command, and a redacted error. Keep private logs and contact CSVs out of public issues. Changes to dependencies must pass the same tests and package privacy checks.

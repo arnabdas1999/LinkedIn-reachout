@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "linkedin-outreach-local"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local CSV-driven LinkedIn connection and follow-up workflow"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -24,7 +24,7 @@ linkedin-outreach = "outreach:main"
 dev = ["build>=1.2,<2", "ruff>=0.11,<1"]
 
 [tool.setuptools]
-py-modules = ["outreach", "linkedin_browser", "lead_data", "outreach_config", "outreach_setup", "outreach_errors", "outreach_worker", "outreach_state", "outreach_monitor", "outreach_service"]
+py-modules = ["outreach", "linkedin_browser", "lead_data", "outreach_config", "outreach_setup", "outreach_errors", "outreach_worker", "outreach_state", "outreach_monitor", "outreach_service", "outreach_review"]
 
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements.txt"]}

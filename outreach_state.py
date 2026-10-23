@@ -7,7 +7,7 @@ from pathlib import Path
 import sqlite3
 import uuid
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def check_database(db):
@@ -55,10 +55,27 @@ def migrate(db, path, existed):
         columns = {row[1] for row in db.execute('PRAGMA table_info(leads)')}
         if 'failure_count' not in columns:
             db.execute('ALTER TABLE leads ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0')
+        for name, definition in (
+            ('review_attempts', 'INTEGER NOT NULL DEFAULT 0'),
+            ('review_next_at', 'TEXT'), ('review_exhausted', 'INTEGER NOT NULL DEFAULT 0'),
+            ('review_last_result', "TEXT NOT NULL DEFAULT ''"),
+            ('automatic_resumes', 'INTEGER NOT NULL DEFAULT 0'),
+            ('observed_company', "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if name not in columns:
+                db.execute(f'ALTER TABLE leads ADD COLUMN {name} {definition}')
         columns = {row[1] for row in db.execute('PRAGMA table_info(actions)')}
         for name in ('quota_at', 'click_started_at', 'finished_at'):
             if name not in columns:
                 db.execute(f'ALTER TABLE actions ADD COLUMN {name} TEXT')
+        if 'guard_version' not in columns:
+            # Historical NULL click markers cannot prove a click never happened.
+            db.execute('ALTER TABLE actions ADD COLUMN guard_version INTEGER NOT NULL DEFAULT 0')
+        db.execute('''CREATE TABLE IF NOT EXISTS review_events (
+            id INTEGER PRIMARY KEY, lead_id INTEGER NOT NULL REFERENCES leads(id),
+            at TEXT NOT NULL, outcome TEXT NOT NULL, detail TEXT NOT NULL,
+            action_snapshot TEXT NOT NULL DEFAULT '{}'
+        )''')
         db.execute('UPDATE actions SET quota_at=coalesce(sent_at,started_at) WHERE quota_at IS NULL')
         db.execute('CREATE TABLE IF NOT EXISTS campaign_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
         db.execute('INSERT OR IGNORE INTO campaign_meta VALUES (?,?)', ('campaign_id', str(uuid.uuid4())))
@@ -123,7 +140,8 @@ def resume_contact(store, lead_id):
     if lead['message_2_at']:
         raise ValueError('This sequence is already complete')
     state = 'message_1_sent' if lead['message_1_at'] else 'accepted' if lead['accepted_at'] else 'invited' if lead['invited_at'] else 'new'
-    store.update(lead_id, state=state, reason='', failure_count=0, next_check_at=None)
+    store.update(lead_id, state=state, reason='', failure_count=0, next_check_at=None,
+                 review_attempts=0, review_next_at=None, review_exhausted=0, review_last_result='Resumed by operator')
 
 
 def automatic_backup(directory, cfg, now):

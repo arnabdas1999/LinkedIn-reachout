@@ -8,6 +8,7 @@ import os
 import re
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from playwright.sync_api import sync_playwright
@@ -15,6 +16,7 @@ from playwright.sync_api import sync_playwright
 from linkedin_browser import LinkedInBrowser, brave_executable
 from outreach import StopRun
 from outreach_errors import CyclePaused, InvitationFormMissing, InvitationHeld, ProfileNeedsReview
+from outreach_review import ReviewResult
 
 URL = "https://www.linkedin.com/in/alex/"
 LEAD = {"id": 1, "url": URL, "first_name": "Alex", "full_name": "Alex Example", "company": "Oracle"}
@@ -62,6 +64,7 @@ class PersistentBrowserChecks(unittest.TestCase):
                 pass
         with tempfile.TemporaryDirectory() as directory:
             with LinkedInBrowser(Path(directory) / "profile", browser, headless=True) as adapter:
+                adapter.context.set_offline(True)
                 adapter.page.route("**/*", lambda route: route.fulfill(status=200, content_type="text/html", body=HTML.replace("DEGREE", "2nd").replace("EVENTS", "")))
                 self.assertEqual(adapter.open_profile(LEAD), "new")
                 adapter.send_invitation(LEAD, NOTE)
@@ -91,7 +94,7 @@ class BrowserChecks(unittest.TestCase):
         cls.pw.stop()
 
     def setUp(self):
-        self.context = self.browser.new_context()
+        self.context = self.browser.new_context(offline=True)
         self.page = self.context.new_page()
         self.page.set_default_timeout(1500)
         self.page.set_default_navigation_timeout(15000)
@@ -138,6 +141,108 @@ class BrowserChecks(unittest.TestCase):
         self.adapter.send_invitation(LEAD, NOTE)
         self.assertEqual(self.page.evaluate('window.connectInputs'), 1)
         self.assertEqual(self.page.evaluate('window.sends'), 1)
+
+    def test_automatic_review_confirms_pending_without_clicking_connect_or_send(self):
+        self.fixture(transform=lambda html: re.sub(r'<button id="connect"[^>]*>Connect</button>', '<button>Pending</button>', html))
+        result = self.adapter.review_contact(LEAD, {'kind':'invite','message':NOTE}, {})
+        self.assertIsInstance(result, ReviewResult)
+        self.assertEqual(result.outcome, 'sent')
+        self.assertIsNone(self.page.evaluate('window.sends'))
+
+    def test_automatic_review_requires_outbound_sender_evidence_for_exact_message(self):
+        self.fixture('1st', event(NOTE) + event(MESSAGE))
+        self.adapter.self_profile_url = 'https://www.linkedin.com/in/me/'
+        result = self.adapter.review_contact(LEAD, {'kind':'message_1','message':MESSAGE,'guard_version':0,'click_started_at':None}, {'invite':NOTE})
+        self.assertEqual(result.outcome, 'sent')
+        self.assertIsNone(self.page.evaluate('window.sends'))
+
+    def test_identical_inbound_message_is_a_reply_not_a_send_confirmation(self):
+        self.fixture('1st', event(NOTE) + event(MESSAGE, sender='alex'))
+        self.adapter.self_profile_url = 'https://www.linkedin.com/in/me/'
+        result = self.adapter.review_contact(LEAD, {'kind':'message_1','message':MESSAGE}, {'invite':NOTE})
+        self.assertEqual(result.outcome, 'replied')
+        self.assertIsNone(self.page.evaluate('window.sends'))
+
+    def test_unknown_sender_does_not_confirm_an_identical_message(self):
+        self.fixture('1st', event(MESSAGE, sender='unknown'))
+        result = self.adapter.review_contact(LEAD, {'kind':'message_1','message':MESSAGE,'guard_version':0,'click_started_at':None}, {})
+        self.assertEqual(result.outcome, 'ready')
+        self.assertIsNone(self.page.evaluate('window.sends'))
+
+    def test_review_clears_only_a_guard_proven_undispatched_campaign_draft(self):
+        def draft(html):
+            return html.replace('contenteditable="true"></div>', 'contenteditable="true">' + MESSAGE + '</div>')
+        self.fixture('1st', transform=draft)
+        result = self.adapter.review_contact(LEAD, {'kind':'message_1','message':MESSAGE,'guard_version':1,'click_started_at':None}, {})
+        self.assertEqual(result.outcome, 'ready')
+        self.assertEqual(self.page.locator('[contenteditable]').inner_text().strip(), '')
+        self.assertIsNone(self.page.evaluate('window.sends'))
+
+    def test_review_preserves_a_different_manual_draft(self):
+        self.fixture('1st', transform=lambda html: html.replace('contenteditable="true"></div>', 'contenteditable="true">Manual draft</div>'))
+        result = self.adapter.review_contact(LEAD, {'kind':'message_1','message':MESSAGE,'guard_version':1,'click_started_at':None}, {})
+        self.assertEqual(result.outcome, 'unresolved')
+        self.assertEqual(self.page.locator('[contenteditable]').inner_text(), 'Manual draft')
+
+    def test_abbreviated_name_requires_same_url_and_corroborating_company(self):
+        self.adapter.automatic_review = True
+        def employer(html):
+            return html.replace('Alex Example', 'Alex E.').replace('</section></main>', '<a href="/company/oracle/">Oracle Corporation</a></section></main>')
+        self.fixture(transform=employer)
+        self.assertEqual(self.adapter.open_profile(LEAD), 'new')
+        self.assertEqual(self.adapter.effective_lead(LEAD)['full_name'], 'Alex E.')
+        self.assertEqual(self.adapter.review_contact(LEAD, None, {}).outcome, 'ready')
+
+    def test_abbreviated_name_without_corroborating_company_stays_held(self):
+        self.adapter.automatic_review = True
+        self.fixture(transform=lambda html: html.replace('Alex Example', 'Alex E.'))
+        with self.assertRaises(ProfileNeedsReview):
+            self.adapter.open_profile(LEAD)
+
+    def test_server_profile_redirect_requires_exact_name_and_keeps_source_identity(self):
+        self.adapter.automatic_review = True
+        self.fixture()
+        destination = 'https://www.linkedin.com/in/alex-renamed/'
+        self.page.goto(destination)
+        source = SimpleNamespace(url=URL, redirected_from=None)
+        response = SimpleNamespace(status=200, request=SimpleNamespace(url=destination, redirected_from=source))
+        # Playwright routing does not re-intercept a redirect continuation.
+        # Supply redirect metadata against an intercepted final document.
+        with patch.object(self.page, 'goto', return_value=response):
+            self.assertEqual(self.adapter.open_profile(LEAD), 'new')
+        self.assertEqual(self.adapter.effective_lead(LEAD)['url'], 'https://www.linkedin.com/in/alex-renamed/')
+        self.assertEqual(LEAD['url'], URL)
+
+    def test_client_side_url_change_is_not_a_verified_profile_redirect(self):
+        self.adapter.automatic_review = True
+        self.fixture(transform=lambda html: html.replace('</body>', '<script>history.replaceState({},"","/in/other/")</script></body>'))
+        with self.assertRaises(ProfileNeedsReview):
+            self.adapter.open_profile(LEAD)
+
+    def test_multiple_panels_use_only_one_verified_recipient_and_preserve_other_draft(self):
+        self.fixture('1st', event(NOTE))
+        self.page.evaluate('''() => {
+            const selected=document.querySelector('.msg-overlay-conversation-bubble');
+            selected.style.display='block';
+            const other=selected.cloneNode(true);
+            other.id='other-thread';
+            other.querySelector('.msg-overlay-bubble-header__title').innerText='Other Person';
+            other.querySelector('[contenteditable]').innerText='Preserved manual draft';
+            document.body.append(other);
+        }''')
+        self.adapter.send_message(LEAD, MESSAGE, {'invite':NOTE})
+        self.assertEqual(self.page.evaluate('window.sends'), 1)
+        self.assertEqual(self.page.locator('#other-thread [contenteditable]').inner_text(), 'Preserved manual draft')
+
+    def test_two_matching_conversation_panels_remain_ambiguous(self):
+        self.fixture('1st', event(NOTE))
+        self.page.evaluate('''() => {
+            const panel=document.querySelector('.msg-overlay-conversation-bubble');
+            panel.style.display='block'; document.body.append(panel.cloneNode(true));
+        }''')
+        with self.assertRaises(StopRun):
+            self.adapter.send_message(LEAD, MESSAGE, {'invite':NOTE})
+        self.assertIsNone(self.page.evaluate('window.sends'))
 
     def test_guard_denial_before_connect_does_not_send_or_open_composer(self):
         self.fixture()

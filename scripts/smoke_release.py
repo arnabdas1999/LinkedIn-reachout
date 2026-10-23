@@ -25,7 +25,7 @@ def main():
         def run(*args):
             return subprocess.run([str(python), *args], cwd=workspace, check=True, capture_output=True, text=True)
         run('-m', 'pip', '--disable-pip-version-check', 'install', str(wheels[0]))
-        run('-c', "import outreach,outreach_worker,outreach_service,outreach_state,outreach_monitor; assert 'site-packages' in outreach.__file__")
+        run('-c', "import outreach,outreach_worker,outreach_service,outreach_state,outreach_monitor,outreach_review; assert 'site-packages' in outreach.__file__")
         source = workspace / 'contacts.csv'
         source.write_text('Full Name,Company,LinkedIn Profile\nAlex Example,Example Company,https://www.linkedin.com/in/fixture-not-real/\n', encoding='utf-8')
         run('-m', 'outreach', 'init', '--csv', str(source), '--browser', 'chromium', '--timezone', 'UTC', '--state-directory', str(workspace / 'state'))

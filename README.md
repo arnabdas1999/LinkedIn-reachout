@@ -12,7 +12,7 @@ A local Python app that reads your contacts CSV, personalizes your message templ
 - Supports your connection note, a message after acceptance, and a later follow-up.
 - Stops a person's sequence when a reply or an unrecognized/manual message appears.
 - Journals sends before clicking, prevents parallel workers, and never blindly retries an uncertain send.
-- Isolates contact failures, retries read-only page loads, and recovers temporary browser failures with a cooldown. Held or uncertain sends are never automatically retried and still count toward limits.
+- Isolates contact failures, retries read-only page loads, and recovers temporary browser failures with a cooldown. Automatic review confirms delivery from positive evidence and requeues only proven never-dispatched actions. Ambiguous attempts retain their quota reservation.
 - Provides an offline preview, setup diagnostics, background start/stop, progress and rotating logs.
 - Supervises the worker process, records heartbeats and daily reports, and raises desktop alerts for blocked or stalled work on Windows.
 - Keeps versioned state with automatic SQLite backups, guarded restore, and explicit contact recovery commands.
@@ -146,6 +146,10 @@ Useful settings in [settings.example.json](settings.example.json):
 | `heartbeat_interval_seconds`, `stalled_after_seconds` | Health snapshots and stalled-progress detection; defaults 30 and 300 seconds. |
 | `desktop_notifications`, `notification_cooldown_minutes` | Windows desktop alerts and repeat-alert cooldown; defaults `true` and 30 minutes. Alerts are also saved locally. |
 | `backup_interval_hours`, `backup_retention` | Automatic snapshot interval and number of completed backups retained; defaults 24 hours and 14. |
+| `automatic_review` | Automatically verify held contacts during watcher cycles; default `true`. |
+| `review_checks_per_run`, `review_retry_limit` | Maximum held contacts checked per cycle and failed reviews before parking; defaults 5 and 3. |
+| `review_interval_minutes` | Initial held-contact review delay and increasing recheck interval; default 60 minutes, capped at 24 hours. |
+| `automatic_resume_limit` | Maximum automatic requeues per contact; default 3. |
 
 Relative paths resolve beside `settings.json`, not beside the installed Python package. Select another settings file with `linkedin-outreach --settings /path/settings.json COMMAND`. Use a separate `state_directory` for a genuinely separate campaign; keep it unchanged when upgrading to retain duplicate protection.
 
@@ -177,13 +181,27 @@ The background watcher supervises browser cycles. A slow page gets bounded read-
 | Identity mismatch, unreadable recipient/history, existing draft in the selected thread | Hold that contact; continue with others without sending to the unverified recipient. |
 | Slow profile or conversation | Retry the read, then defer the contact with an increasing delay. Hold after the configured retry limit. |
 | Browser crash, transport/network failure, consecutive contact failures | Close that browser session, report `backoff`, wait 60/120/240 seconds up to the configured maximum, then start a fresh session. |
-| Crash or timeout during a possible send | Keep the journal entry as `unknown`, hold that recipient, reserve quota, and process unrelated contacts. No automatic resend or new follow-up to that recipient. |
+| Crash or timeout during a possible send | Keep the journal entry as `unknown`, hold that recipient, reserve quota, and process unrelated contacts. Automatic review requires positive confirmation before advancing, or proof that no send-capable click occurred before requeuing. |
 | Login, verification, invitation/account limit | Stop with `blocked` status for manual attention. No automatic challenge or limit bypass. |
 | Invalid configuration, damaged/unwritable database, unexpected programming error | Stop with an explicit failure; these need repair rather than repeated send attempts. |
 
 Repeated errors open a circuit breaker so a changed layout does not immediately run through the CSV. `status` shows whether the worker is working, waiting, outside working hours, recovering, blocked or failed, along with the retry time and error when relevant. Private `worker-status.json` contains the same health information. Stop requests interrupt cooldown waits.
 
 The parent supervisor restarts an exited worker while the saved intent is running. It preserves explicit pauses and latches account blocks or fatal failures until you repair the cause and explicitly start again. It alerts on a live but stalled worker instead of force-killing a possible send. The Windows logon task restarts supervision after OS login. Live layouts and account behavior still need ongoing validation; passing fixtures does not establish unattended compatibility with every LinkedIn variant.
+
+### Automatic contact review
+
+Held contacts enter a persistent review schedule. The watcher checks a bounded number each cycle, including when the new-invitation allowance is exhausted. Review opens profiles/conversations to verify their current state; it does not click Connect or Send.
+
+- A verified Pending or connected profile confirms an earlier uncertain invitation. This confirms the connection request, not the exact invitation-note text.
+- An exact message with outbound-sender evidence confirms an uncertain follow-up. Identical inbound text does not qualify. A detected reply or manual conversation ends the sequence.
+- Corrected profiles and readable conversations can resume from the last confirmed stage. A missing company can be filled from one unambiguous visible company link; the input CSV remains unchanged.
+- Abbreviated names require the same exact profile URL, matching first name and initials, and a corroborating visible company link. Profile URL changes require a LinkedIn HTTP redirect chain and an exact name match. Source URLs remain unchanged, preventing duplicate imports.
+- An action can be automatically requeued only when its guard journal proves no send-capable click was dispatched and fresh profile/conversation checks pass. The previous action is archived in `review_events` before its reservation is released. Older NULL click markers are not treated as proof.
+
+Unresolved evidence gets increasing read-only rechecks. After the configured limit, that contact is parked and excluded; the campaign continues without requiring operator intervention for that contact. Possible sends remain reserved and are not blindly repeated. After restarting/importing, changes to source identity fields or message templates make held cases eligible for fresh verification; historical sends are preserved. Login, account challenges and platform limits still require your attention.
+
+`status` lists review eligibility, attempts and the next check. Daily reports include pending/parked counts and review outcomes. To run only the verification pass with the worker stopped, use `review --live`; `review` without `--live` previews the due count. This command can update verified states but does not send messages itself. A recovered follow-up uses the confirmation-observation time for the next delay, so it cannot trigger an early subsequent message.
 
 ### Health, alerts and daily reports
 
@@ -209,6 +227,8 @@ linkedin-outreach health                  # Machine-readable health details
 linkedin-outreach report                  # Private daily counts and constraints
 linkedin-outreach backup                  # Consistent SQLite snapshot
 linkedin-outreach resume 1                # Requeue a corrected read-only hold
+linkedin-outreach review                  # Preview due automatic reviews
+linkedin-outreach review --live           # Verify held contacts; no Connect/Send clicks
 linkedin-outreach inspect --lead-id 1     # Visible, read-only profile inspection
 linkedin-outreach stop 1                  # Stop one person's sequence, with worker stopped
 ```
@@ -219,7 +239,7 @@ linkedin-outreach stop 1                  # Stop one person's sequence, with wor
 - **Already running:** use `status`; stop the existing worker before login, inspection or changing settings. Do not delete lock files to bypass a live process.
 - **No new invites:** check the total campaign cap, daily/weekly caps, company filter, working window and existing Pending/connected state.
 - **Login/verification required:** complete `login` manually. There is no automated challenge bypass.
-- **Identity mismatch before an action:** that person is held for review and verified profiles continue. Check `status` and review their CSV identity; the app does not guess that abbreviated names identify the same person.
+- **Identity mismatch before an action:** that person enters automatic review while verified profiles continue. Only the corroborated identity rules above can resolve an abbreviation or redirect; other cases are eventually parked.
 - **Unexpected UI or temporary browser failure:** check `status` for a held contact or automatic recovery time. Repeated layout failures may require an adapter update; do not remove send history to force retries.
 - **Uncertain send:** inspect LinkedIn before resolving it, as described below.
 
@@ -227,7 +247,7 @@ Logs are in your state directory: `outreach.log` with rotation, `watch-output.lo
 
 ### Resolve an uncertain send
 
-The script commits a journal entry **before** sending. If it crashes or cannot verify the outcome, that recipient is held and the attempt counts toward limits. Unrelated contacts continue; the uncertain recipient is never automatically retried. With the worker stopped, check LinkedIn manually, then choose exactly one outcome:
+The script commits a journal entry **before** sending. If it crashes or cannot verify the outcome, that recipient is held and the attempt counts toward limits. Automatic review first tries to establish a positive outcome or prove that no click was dispatched. Unresolved cases remain reserved and eventually park. For an optional operator override, stop the worker, check LinkedIn manually, then choose exactly one outcome:
 
 ```bash
 linkedin-outreach reconcile LEAD_ID sent

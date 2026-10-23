@@ -11,6 +11,7 @@ Keep this checklist with a release candidate. Code coverage of an operation and 
 - Private daily reports separate confirmed sends from reserved attempts. They record known constraints without inferring an unsupported cause for a shortfall.
 - Schema upgrades back up existing state. Restore validates snapshots, rejects lost send history/different campaign identity, preserves damaged files and requires an explicit audit acknowledgment.
 - Contact recovery refuses a possible send until explicit reconciliation. State migration preserves the old copy and the settings backup.
+- Automatic review verifies held contacts with bounded persistent rechecks. Positive connection/outbound-message evidence can confirm delivery; only a guard-proven never-dispatched action can be requeued. Review events retain action snapshots and unresolved cases park without blocking other contacts.
 - The clean-wheel smoke check installs into a fresh environment and verifies offline setup, detached start/stop, recovery after terminating its owned fixture worker, and a retained explicit pause, with zero action rows.
 - CI defines Windows/macOS/Linux with Python 3.11/3.13, local browser fixtures, package checks and clean-wheel smoke checks. A configured workflow is not evidence of a hosted pass.
 
@@ -27,6 +28,7 @@ Record the commit, operating system, Python/browser version and outcome privatel
 - [ ] Desktop notification request is tested with OS notification settings enabled. If display is suppressed, health files/local alerts remain usable.
 - [ ] Manual login expiry is repaired and explicitly resumed; account challenges stay paused before that action.
 - [ ] A real acceptance is observed, Message 1 becomes due after its configured delay, Message 2 becomes due after Message 1, and a recipient reply stops the sequence. Use consenting test recipients when possible.
+- [ ] Live held-contact review confirms visible outcomes, preserves original quota reservations, resumes only verified cases and parks unresolved cases without duplicate sends. Repeat affected live-observation evidence after enabling automatic review.
 - [ ] A backup is restored in an isolated campaign, independently audited, acknowledged and resumed without duplicate actions.
 - [ ] At least 14 consecutive days of the release candidate are observed: daily reports, actual counts, held contacts, faults and recovery are reviewed; no unexplained duplicate, wrong-recipient or unacknowledged uncertain resend occurs.
 

@@ -10,7 +10,7 @@ import sys
 from string import Formatter
 from zoneinfo import ZoneInfo
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 TEMPLATE_KEYS = ("connection_note", "connection_note_without_location", "message_1", "message_2")
 DEFAULTS = {
     "csv_file": "contacts.csv", "browser_channel": "chromium", "browser_executable": None,
@@ -25,6 +25,8 @@ DEFAULTS = {
     "heartbeat_interval_seconds": 30, "stalled_after_seconds": 300,
     "desktop_notifications": True, "notification_cooldown_minutes": 30,
     "backup_interval_hours": 24, "backup_retention": 14,
+    "automatic_review": True, "review_checks_per_run": 5,
+    "review_retry_limit": 3, "review_interval_minutes": 60, "automatic_resume_limit": 3,
     "message_1_delay_days": 1, "message_2_delay_days": 3,
     "working_days": [0, 1, 2, 3, 4], "working_hours": [9, 18], "company_filter": "",
     "connection_note": "Hi {first_name}, I'm looking to expand my network of engineering leaders in and around {location}. Would love to connect!",
@@ -41,6 +43,7 @@ POSITIVE_INTS = (
     "retry_initial_seconds", "retry_max_seconds",
     "heartbeat_interval_seconds", "stalled_after_seconds", "notification_cooldown_minutes",
     "backup_interval_hours", "backup_retention",
+    "review_checks_per_run", "review_retry_limit", "review_interval_minutes", "automatic_resume_limit",
 )
 ALIASES = {"firstname": "first_name", "companyname": "company", "location": "location",
            "first_name": "first_name", "company": "company"}
@@ -110,6 +113,10 @@ def load_settings(path=None):
         raise ValueError("headless must be true or false")
     if type(cfg['desktop_notifications']) is not bool:
         raise ValueError('desktop_notifications must be true or false')
+    if type(cfg['automatic_review']) is not bool:
+        raise ValueError('automatic_review must be true or false')
+    if cfg['review_checks_per_run'] > 50 or cfg['review_retry_limit'] > 10 or cfg['automatic_resume_limit'] > 10:
+        raise ValueError('Review checks must be at most 50; review/requeue limits must be at most 10')
     if cfg['stalled_after_seconds'] < cfg['heartbeat_interval_seconds'] * 2:
         raise ValueError('stalled_after_seconds must be at least twice heartbeat_interval_seconds')
     ZoneInfo(cfg["timezone"])

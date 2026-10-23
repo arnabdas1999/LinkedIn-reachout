@@ -121,6 +121,12 @@ def daily_report(directory, cfg, day=None, now=None):
                 reserved[row['kind']] += row['n']
         states = dict(db.execute('SELECT state,count(*) FROM leads GROUP BY state').fetchall())
         reasons = [dict(row) for row in db.execute("SELECT reason,count(*) n FROM leads WHERE state='needs_review' GROUP BY reason")]
+        review = {'enabled': cfg.get('automatic_review', False), 'pending': 0, 'parked': 0, 'events': {}}
+        if 'review_exhausted' in {row['name'] for row in db.execute('PRAGMA table_info(leads)')}:
+            review['pending'] = db.execute("SELECT count(*) FROM leads WHERE state='needs_review' AND review_exhausted=0").fetchone()[0]
+            review['parked'] = db.execute("SELECT count(*) FROM leads WHERE state='needs_review' AND review_exhausted=1").fetchone()[0]
+            review['events'] = dict(db.execute('SELECT outcome,count(*) FROM review_events WHERE at>=? AND at<? GROUP BY outcome',
+                (start.isoformat(timespec='seconds'), end.isoformat(timespec='seconds'))).fetchall())
         used_week = db.execute(f"SELECT count(*) FROM actions WHERE kind='invite' AND status IN ('prepared','unknown','sent','cancelled') AND {timing}>=?", ((now - timedelta(days=7)).isoformat(timespec='seconds'),)).fetchone()[0]
         used_total = db.execute("SELECT count(*) FROM actions WHERE kind='invite' AND status IN ('prepared','unknown','sent','cancelled')").fetchone()[0]
     health = read_status(directory / 'worker-status.json')
@@ -147,7 +153,7 @@ def daily_report(directory, cfg, day=None, now=None):
                 reserved_attempts=reserved, invitation_limit=cfg['invitations_per_day'], lead_states=states,
                 shortfall=max(0, cfg['invitations_per_day'] - confirmed['invite']),
                 remaining_daily_allowance=max(0, cfg['invitations_per_day'] - confirmed['invite'] - reserved['invite']),
-                held_reasons=reasons, worker_phase=health.get('phase'), last_error=health.get('last_error'),
+                held_reasons=reasons, automatic_review=review, worker_phase=health.get('phase'), last_error=health.get('last_error'),
                 constraints=constraints,
                 window_complete=now.astimezone(zone).date() > day or now.astimezone(zone).hour >= cfg['working_hours'][1])
     atomic_json(directory / 'reports' / (str(day) + '.json'), data)

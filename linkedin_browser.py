@@ -45,12 +45,18 @@ def brave_executable():
 class History:
     inbound: bool = False
     unknown: bool = False
+    outbound: tuple[str, ...] = ()
 
 
 class LinkedInBrowser:
-    def __init__(self, profile_dir, channel="chromium", *, headless=True, executable_path=None):
+    supports_send_guard = True
+
+    def __init__(self, profile_dir, channel="chromium", *, headless=True, executable_path=None, automatic_review=False):
         self.profile_dir, self.channel = Path(profile_dir), channel
         self.headless, self.executable_path = headless, executable_path
+        self.automatic_review = automatic_review
+        self.selected_identity = None
+        self.self_profile_url = None
 
     def __enter__(self):
         self.profile_dir.mkdir(parents=True, exist_ok=True)
@@ -169,6 +175,15 @@ class LinkedInBrowser:
         self.guard()
         self.page.locator("nav").first.wait_for(state="visible", timeout=30000)
         self.guard()
+        own = self.page.locator('a[data-control-name="identity_welcome_message"], .feed-identity-module a[href*="/in/"], nav a[aria-label="View your profile"], nav a[aria-label="View my profile"]')
+        identities = set()
+        for node in own.all():
+            if node.is_visible():
+                try:
+                    identities.add(canonical_profile(urljoin('https://www.linkedin.com', node.get_attribute('href') or '')))
+                except ValueError:
+                    pass
+        self.self_profile_url = next(iter(identities)) if len(identities) == 1 else None
         self.close_other_pages()
 
     def close_other_pages(self):
@@ -198,7 +213,7 @@ class LinkedInBrowser:
         for panel, _ in self.conversation_panels():
             editors = panel.locator('[contenteditable="true"]').all()
             if any(editor.inner_text().strip() for editor in editors if editor.is_visible()):
-                raise StopRun("An open conversation contains an unsent draft. Clear it manually before running.")
+                raise ContactNeedsReview("An open conversation contains an unsent draft; it was preserved")
             close = self.one_visible(panel.get_by_role("button", name=re.compile(r"^Close (?:your )?conversation", re.I)),
                                      "close-conversation button")
             close.click()
@@ -285,9 +300,43 @@ class LinkedInBrowser:
         finally:
             self.page.keyboard.press("Escape")
 
+    def effective_lead(self, lead):
+        identity = self.selected_identity
+        if identity and identity['source'] == (lead['url'], lead['full_name']):
+            return {**dict(lead), 'url': identity['url'], 'full_name': identity['name']}
+        return lead
+
+    def companies(self):
+        return sorted({node.inner_text().strip() for node in self.topcard().locator('a[href*="/company/"]').all()
+                       if node.is_visible() and node.inner_text().strip()})
+
+    def corroborated_abbreviation(self, expected, actual, company):
+        before = [part.strip('.,()') for part in normalized(expected).split()]
+        after = [part.strip('.,()') for part in normalized(actual).split()]
+        if len(before) < 2 or len(before) != len(after) or before[0] != after[0]:
+            return False
+        if not all(a == b or len(b) == 1 and a.startswith(b) for a, b in zip(before[1:], after[1:])):
+            return False
+        def key(value):
+            return ' '.join(re.sub(r'[^\w\s]', ' ', normalized(value)).split()).removesuffix(' corporation').removesuffix(' corp').removesuffix(' inc').removesuffix(' ltd')
+        return bool(company) and any(key(value) == key(company) for value in self.companies())
+
+    def server_redirect(self, response, source, destination):
+        if response is None or not 200 <= response.status < 300:
+            return False
+        chain, request = [], response.request
+        while request is not None:
+            try:
+                chain.append(canonical_profile(request.url))
+            except ValueError:
+                return False
+            request = request.redirected_from
+        return len(chain) > 1 and chain[0] == destination and chain[-1] == source
+
     def open_profile(self, lead):
+        self.selected_identity = None
         self.close_conversations()
-        self.page.goto(lead["url"], wait_until="domcontentloaded")
+        response = self.page.goto(lead["url"], wait_until="domcontentloaded")
         self.guard()
         unavailable = self.page.get_by_text(re.compile(r"^(?:This profile is not available|This page doesn.t exist).*$", re.I))
         if self.one_visible(unavailable, "unavailable-profile notice", optional=True):
@@ -298,14 +347,17 @@ class LinkedInBrowser:
             actual_url = canonical_profile(self.page.url)
         except ValueError:
             raise ContactNeedsReview("Profile navigation redirected to an unexpected URL") from None
-        if actual_url != lead["url"]:
+        if actual_url != lead["url"] and not (self.automatic_review and self.server_redirect(response, lead['url'], actual_url)):
             raise ProfileNeedsReview("Profile URL changed. Review this lead before sending anything")
         name = self.one_visible(self.profile_heading(), "profile name").inner_text()
-        if normalized(name) != normalized(lead["full_name"]):
+        exact = normalized(name) == normalized(lead['full_name'])
+        if not exact and not (self.automatic_review and actual_url == lead['url'] and self.corroborated_abbreviation(lead['full_name'], name, lead['company'])):
             raise ProfileNeedsReview(f"Profile name mismatch: CSV has {lead['full_name']!r}; page shows {name!r}")
+        self.selected_identity = {'source': (lead['url'], lead['full_name']), 'url': actual_url, 'name': name}
         return self.profile_state()
 
     def invitation_dialog(self, lead):
+        lead = self.effective_lead(lead)
         expected = urlsplit(lead["url"]).path.strip("/").split("/")[-1]
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
@@ -356,6 +408,7 @@ class LinkedInBrowser:
         control.click(timeout=10000, no_wait_after=True)
 
     def send_invitation(self, lead, message):
+        # Keep the original source identity for any fresh verification below.
         self.guard()
         if self.profile_state() != "new":
             raise ContactNeedsReview("This profile is no longer eligible for a new invitation")
@@ -413,7 +466,8 @@ class LinkedInBrowser:
             return
         raise ContactNeedsReview("Clicked Send but could not verify Pending. Check LinkedIn; do not retry blindly")
 
-    def open_conversation(self, lead):
+    def open_conversation(self, lead, *, allow_draft=False):
+        lead = self.effective_lead(lead)
         for attempt in range(2):
             self.guard()
             panels = self.conversation_panels()
@@ -426,6 +480,15 @@ class LinkedInBrowser:
                     if panels:
                         break
                     self.page.wait_for_timeout(250)
+            if len(panels) > 1:
+                matching = []
+                for candidate, frame in panels:
+                    header = candidate.locator('.msg-overlay-bubble-header:visible, .msg-overlay-conversation-bubble-header:visible')
+                    if header.count() == 1 and any(normalized(node.inner_text()) == normalized(lead['full_name'])
+                        for node in header.locator('h2, .msg-overlay-bubble-header__title').all() if node.is_visible()):
+                        matching.append((candidate, frame))
+                if len(matching) == 1:
+                    panels = matching
             if len(panels) != 1:
                 # Like More, Message can render before its handler is ready.
                 # Only retry opening the conversation, never composing or sending.
@@ -454,17 +517,33 @@ class LinkedInBrowser:
         editors = panel.locator('[contenteditable="true"][role="textbox"], .msg-form__contenteditable[contenteditable="true"]')
         editors.first.wait_for(state="visible")
         editor = self.one_visible(editors, "message editor")
-        if editor.inner_text().strip():
+        if editor.inner_text().strip() and not allow_draft:
             raise ContactNeedsReview("Conversation has an unsent draft. Clear it manually")
         return panel, editor
 
-    def history(self, panel, lead, known):
+    def history(self, panel, lead, known, pending_message=None):
+        lead = self.effective_lead(lead)
         self.guard()
         if getattr(self, "message_frame", None) is not None:
             self.guard(self.message_frame)
         message_list = self.one_visible(panel.locator(".msg-s-message-list-content"), "message history", optional=True)
         if message_list is None:
             message_list = self.one_visible(panel.locator(".msg-s-message-list"), "message history", optional=True)
+        if message_list is None:
+            # A genuinely empty thread may have a zero-height list. Require a
+            # single recognized, non-hidden structure inside the verified panel;
+            # missing structures and hidden histories still fail closed.
+            for selector in ('.msg-s-message-list-content', '.msg-s-message-list'):
+                candidates = panel.locator(selector)
+                if candidates.count() == 1 and candidates.first.evaluate('''el => {
+                    for (let n=el; n; n=n.parentElement) {
+                        const s=getComputedStyle(n);
+                        if(s.display==='none'||s.visibility==='hidden'||n.getAttribute('aria-hidden')==='true') return false;
+                    }
+                    return el.innerText.trim()==='' && !el.querySelector('.msg-s-event-listitem');
+                }'''):
+                    message_list = candidates.first
+                    break
         if message_list is None:
             raise ContactNotReady("Cannot verify loaded message history")
         # Wait for the rendered conversation to settle, not for arbitrary send timing.
@@ -487,6 +566,8 @@ class LinkedInBrowser:
         bodies = panel.locator(".msg-s-event-listitem__body")
         texts = [normalized(item.inner_text()) for item in bodies.all() if item.is_visible()]
         allowed = {normalized(text) for text in known.values()}
+        if pending_message:
+            allowed.add(normalized(pending_message))
         result = History()
         for text in texts:
             # Any message not sent by this campaign stops the sequence. This includes
@@ -501,6 +582,19 @@ class LinkedInBrowser:
                 pass
         # Textless messages/attachments are not silently treated as an empty thread.
         events = panel.locator(".msg-s-event-listitem")
+        outbound = []
+        for item in events.all():
+            links = set()
+            for link in item.locator('a[href*="/in/"]').all():
+                try:
+                    links.add(canonical_profile(urljoin('https://www.linkedin.com', link.get_attribute('href') or '')))
+                except ValueError:
+                    pass
+            # An identical inbound message is not proof that our send succeeded.
+            own_class = 'msg-s-event-listitem--self' in (item.get_attribute('class') or '').split()
+            if lead['url'] not in links and (own_class or self.self_profile_url and self.self_profile_url in links):
+                outbound.extend(normalized(node.inner_text()) for node in item.locator('.msg-s-event-listitem__body').all() if node.is_visible())
+        result.outbound = tuple(outbound)
         if events.count() > len(texts):
             result.unknown = True
         if not texts and message_list.inner_text().strip():
@@ -514,6 +608,38 @@ class LinkedInBrowser:
     def conversation(self, lead, known):
         panel, _ = self.open_conversation(lead)
         return self.history(panel, lead, known)
+
+    def review_contact(self, lead, action, known):
+        from outreach_review import ReviewResult
+        state = self.open_profile(lead)
+        if state == 'unavailable':
+            return ReviewResult('unavailable', 'Verified profile is unavailable; excluded without sending', state)
+        companies = self.companies()
+        company = companies[0] if len(companies) == 1 else ''
+        if action and action['kind'] == 'invite':
+            if state in ('pending', 'connected'):
+                return ReviewResult('sent', 'Fresh verified profile confirms an existing ' + state + ' connection; invitation note delivery is not independently verified', state)
+            return ReviewResult('ready', 'Fresh profile is verified; no send was performed during review', state, company)
+        if state == 'connected':
+            panel, editor = self.open_conversation(lead, allow_draft=True)
+            pending = action['message'] if action else None
+            history = self.history(panel, lead, known, pending_message=pending)
+            if action and normalized(action['message']) in history.outbound:
+                return ReviewResult('sent', 'Exact message found with verified outbound sender evidence', state,
+                                    replied=history.inbound, history_safe=not history.unknown)
+            if history.inbound:
+                return ReviewResult('replied', 'A reply or manual conversation exists; automatic sequence ended', state)
+            if history.unknown:
+                return ReviewResult('unresolved', 'Conversation history is still incomplete or unverifiable', state)
+            draft = editor.inner_text().strip()
+            if draft:
+                if action and action['guard_version'] == 1 and action['click_started_at'] is None and draft == action['message'].strip():
+                    # Ownership comes from the journal plus the no-dispatch
+                    # guard; never clear an arbitrary/manual draft.
+                    editor.fill('')
+                else:
+                    return ReviewResult('unresolved', 'Existing draft was preserved', state)
+        return ReviewResult('ready', 'Fresh profile and available conversation checks passed', state, company)
 
     def send_message(self, lead, message, known):
         if self.profile_state() != "connected":

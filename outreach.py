@@ -23,6 +23,7 @@ from outreach_errors import (AccountBlocked, ContactNeedsReview, ContactNotReady
 
 from lead_data import (SOURCE_DATA_REASON, SOURCE_DATA_REASONS, canonical_profile,
                        name_parts, read_clean_csv)
+from outreach_review import review_contacts, review_work
 
 ROOT = Path(__file__).resolve().parent
 UTC = timezone.utc
@@ -105,7 +106,9 @@ class Store:
 
     def update(self, lead_id, **values):
         allowed = {"state", "reason", "invited_at", "accepted_at", "message_1_at",
-                   "message_2_at", "last_checked_at", "next_check_at", "failure_count"}
+                   "message_2_at", "last_checked_at", "next_check_at", "failure_count",
+                   "review_attempts", "review_next_at", "review_exhausted", "review_last_result",
+                   "automatic_resumes", "observed_company"}
         if not values or not set(values) <= allowed:
             raise ValueError("Invalid lead update")
         with self.db:
@@ -139,10 +142,18 @@ class Store:
                 else:
                     duplicate += 1
                     existing = self.db.execute("SELECT * FROM leads WHERE url=?", (url,)).fetchone()
+                    if not company and existing['observed_company']:
+                        company = existing['observed_company']
+                        fields = (first, row['Full Name'], company, row.get('Job Title',''),
+                                  row.get('City',''), row.get('State or Province',''))
+                        state = 'new' if first else 'needs_review'
                     if fields != tuple(existing[key] for key in ("first_name", "full_name", "company", "title", "city", "region")):
                         self.db.execute("""UPDATE leads SET first_name=?,full_name=?,company=?,title=?,city=?,region=?
                                            WHERE id=?""", (*fields, existing["id"]))
                         updated += 1
+                        if existing['state'] == 'needs_review':
+                            self.db.execute('''UPDATE leads SET review_attempts=0,review_exhausted=0,
+                                review_next_at=NULL,review_last_result='Source changed; verify again' WHERE id=?''', (existing['id'],))
                     # Only source-data holds can be repaired automatically. A
                     # possible send or stopped sequence must never be requeued.
                     if state == "new" and existing["state"] == "needs_review" and existing["reason"] in SOURCE_DATA_REASONS:
@@ -170,15 +181,15 @@ class Store:
             ORDER BY coalesce(next_check_at, ''), id LIMIT ?
         """, (stamp(now), limit)).fetchall()
 
-    def begin(self, lead_id, kind, message, now):
+    def begin(self, lead_id, kind, message, now, guarded=False):
         # Commit BEFORE clicking anything that might send. A crash never retries it.
         with self.db:
             if self.db.execute("SELECT 1 FROM actions WHERE lead_id=? AND status IN ('prepared','unknown')", (lead_id,)).fetchone():
                 raise ValueError('This contact has an unresolved send; reconcile it before another action')
             self.db.execute("""
-                INSERT INTO actions (lead_id,kind,status,started_at,quota_at,message)
-                VALUES (?,?,'prepared',?,?,?)
-            """, (lead_id, kind, stamp(now), stamp(now), message))
+                INSERT INTO actions (lead_id,kind,status,started_at,quota_at,message,guard_version)
+                VALUES (?,?,'prepared',?,?,?,?)
+            """, (lead_id, kind, stamp(now), stamp(now), message, int(guarded)))
 
     def sent(self, lead_id, kind, now):
         state, column = {
@@ -228,12 +239,16 @@ class Store:
         with self.db:
             self.db.execute("""UPDATE leads SET state='needs_review',reason=(
                 SELECT detail FROM actions WHERE lead_id=leads.id AND status='unknown' ORDER BY id DESC LIMIT 1)
-                WHERE id IN (SELECT lead_id FROM actions WHERE status='unknown')""")
+                WHERE id IN (SELECT lead_id FROM actions WHERE status='unknown')
+                AND state NOT IN ('needs_review','replied','stopped')""")
         return len(rows)
 
     def next_retry(self):
         value = self.db.execute("""SELECT min(next_check_at) FROM leads
-            WHERE state IN ('new','invited','accepted','message_1_sent') AND next_check_at IS NOT NULL""").fetchone()[0]
+            WHERE state IN ('new','invited','accepted','message_1_sent') AND next_check_at IS NOT NULL
+            UNION ALL SELECT min(review_next_at) FROM leads WHERE state='needs_review' AND review_exhausted=0
+        """).fetchall()
+        value = min((row[0] for row in value if row[0]), default=None)
         return parsed(value)
 
     def unresolved(self):
@@ -376,7 +391,9 @@ class Campaign:
             values['next_check_at'] = stamp(self.now() + timedelta(seconds=retry_delay(self.cfg, count)))
             LOG.warning('DEFERRED #%s %s until %s: %s', lead['id'], lead['full_name'], values['next_check_at'], detail)
         else:
-            values.update(state='needs_review', next_check_at=None)
+            values.update(state='needs_review', next_check_at=None, review_attempts=0,
+                          review_next_at=stamp(self.now() + timedelta(minutes=self.cfg['review_interval_minutes'])),
+                          review_exhausted=0, review_last_result='Awaiting automatic verification')
             LOG.warning('HELD #%s %s; other contacts can continue: %s', lead['id'], lead['full_name'], detail)
         self.store.update(lead['id'], **values)
         self.consecutive_failures += 1
@@ -414,7 +431,7 @@ class Campaign:
     def send(self, lead, kind):
         self.preflight(lead, kind)
         message = render(lead, self.cfg)[kind]
-        self.store.begin(lead['id'], kind, message, self.now())
+        self.store.begin(lead['id'], kind, message, self.now(), guarded=getattr(self.browser, 'supports_send_guard', False))
         previous_guard = getattr(self.browser, 'before_action', None)
         self.browser.before_action = lambda: self.preflight(lead, kind, mark_click=True)
         try:
@@ -452,6 +469,7 @@ class Campaign:
 
     def run(self):
         self.store.recover(self.now())
+        review_contacts(self.store, self.cfg, self.browser, self.now, self.check_stop)
         messages = message_attempts = 0
         for lead in self.store.active_due(self.now(), self.cfg['acceptance_checks_per_run']):
             state = self.read(lead, lambda: self.browser.open_profile(lead))
@@ -566,6 +584,8 @@ def profile_directory(channel="chromium", workspace=None, profile_path=None):
 
 
 def campaign_finished(store, cfg):
+    if review_work(store, cfg):
+        return False
     active = store.db.execute("SELECT count(*) FROM leads WHERE state IN ('invited','accepted','message_1_sent')").fetchone()[0]
     cap = cfg["campaign_invitation_limit"]
     cap_reached = cap is not None and store.used("invite") >= cap
@@ -587,6 +607,10 @@ def show_status(store):
     tracked = store.db.execute("SELECT * FROM leads WHERE state NOT IN ('new','skipped') ORDER BY id LIMIT 30").fetchall()
     for row in tracked:
         print(f"#{row['id']} {row['full_name']} | {row['company']} | {row['state']} | {row['reason']}")
+    if 'review_attempts' in {row[1] for row in store.db.execute('PRAGMA table_info(leads)')}:
+        print('Automatic review queue:')
+        for row in store.db.execute("SELECT * FROM leads WHERE state='needs_review' ORDER BY id LIMIT 30"):
+            print(f"#{row['id']} | {'parked' if row['review_exhausted'] else 'eligible'} | checks={row['review_attempts']} | next={row['review_next_at']} | {row['review_last_result']}")
 
 
 def browser_session(cfg, *, visible=False):
@@ -595,7 +619,8 @@ def browser_session(cfg, *, visible=False):
     if executable:
         executable = str(resolve_path(executable, Path(cfg["_workspace"])))
     return LinkedInBrowser(profile_directory(cfg["browser_channel"], cfg["_workspace"], cfg["browser_profile_directory"]),
-                           cfg["browser_channel"], headless=False if visible else cfg["headless"], executable_path=executable)
+                           cfg["browser_channel"], headless=False if visible else cfg["headless"], executable_path=executable,
+                           automatic_review=cfg['automatic_review'])
 
 
 def browser_cycle(store, cfg, stop_path):
@@ -650,6 +675,8 @@ def main(argv=None):
     report = sub.add_parser('report', help='Write a private daily report')
     report.add_argument('--date')
     sub.add_parser('health')
+    review = sub.add_parser('review', help='Verify held contacts without sending; --live enables browser observations and state updates')
+    review.add_argument('--live', action='store_true')
     sub.add_parser('test-notification')
     for name in ('supervise', 'install-startup'):
         item = sub.add_parser(name)
@@ -807,6 +834,13 @@ def main(argv=None):
             elif args.command == "reconcile":
                 store.reconcile(args.lead_id, args.outcome, utcnow())
                 print("Reconciled. Run status to review.")
+            elif args.command == 'review':
+                if not args.live:
+                    print('PREVIEW ONLY. Due automatic reviews:', len(review_work(store, cfg, utcnow())))
+                else:
+                    with browser_session(cfg) as browser:
+                        browser.require_login()
+                        print(json.dumps(review_contacts(store, cfg, browser, utcnow, lambda: None), indent=2))
             elif args.command == "preview" or (args.command in ("run", "watch") and not args.live):
                 print("PREVIEW ONLY. No browser activity or messages.\n")
                 print("Invitation capacity this run:", invite_capacity(store, cfg, utcnow()))
@@ -834,7 +868,7 @@ def main(argv=None):
                     progress(directory, utcnow())
                     with Monitor(cfg, directory):
                         watch_worker(cfg, directory, run_cycle=lambda: browser_cycle(store, cfg, stop_path),
-                                 has_work=lambda: bool(store.active_due(utcnow(), 1)) or (
+                                 has_work=lambda: bool(store.active_due(utcnow(), 1)) or bool(review_work(store, cfg, utcnow())) or (
                                      invite_capacity(store, cfg, utcnow()) > 0 and bool(store.candidates(cfg.get('company_filter', '')))),
                                  is_finished=lambda: campaign_finished(store, cfg), next_retry=store.next_retry,
                                  now=utcnow, wait=lambda seconds: wait_for_stop(stop_path, seconds),
