@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -29,6 +30,7 @@ def initialize(args):
         raise ValueError("The CSV has no contacts")
     cfg = deepcopy(DEFAULTS)
     cfg.update(csv_file=str(csv_path), browser_channel=browser or "chromium", timezone=args.timezone)
+    cfg['state_directory'] = getattr(args, 'state_directory', 'auto')
     path.parent.mkdir(parents=True, exist_ok=True)
     if messages:
         message_path = Path(messages).expanduser().resolve()
@@ -125,10 +127,10 @@ def doctor(cfg):
     return 0 if rows and not problems and not report["invalid_url_rows"] else 2
 
 
-def worker_running(directory):
+def worker_running(directory, lock_name='process.lock'):
     from outreach import ProcessLock
     try:
-        with ProcessLock(directory / "process.lock"):
+        with ProcessLock(directory / lock_name):
             return False
     except StopRun:
         return True
@@ -141,17 +143,21 @@ def install_browser(cfg):
     return 0
 
 
-def start_worker(cfg):
+def start_worker(cfg, record_intent=True):
     directory = state_path(cfg)
     directory.mkdir(parents=True, exist_ok=True)
     from outreach import ProcessLock
     with ProcessLock(directory / "start.lock"):
         if worker_running(directory):
             raise StopRun("An outreach worker is already running. Use status or stop-watch.")
+        if record_intent:
+            from outreach_service import control
+            control(directory, 'running')
         ready = directory / "watcher-ready.json"
         ready.unlink(missing_ok=True)
         command = [sys.executable, "-u", "-m", "outreach", "--settings", cfg["_settings_path"], "watch", "--live"]
-        kwargs = {"cwd": cfg["_workspace"], "stdin": subprocess.DEVNULL, "close_fds": True}
+        kwargs = {"cwd": cfg["_workspace"], "stdin": subprocess.DEVNULL, "close_fds": True,
+                  "env": dict(os.environ, PYTHONIOENCODING='utf-8')}
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
         else:

@@ -14,6 +14,10 @@ A local Python app that reads your contacts CSV, personalizes your message templ
 - Journals sends before clicking, prevents parallel workers, and never blindly retries an uncertain send.
 - Isolates contact failures, retries read-only page loads, and recovers temporary browser failures with a cooldown. Held or uncertain sends are never automatically retried and still count toward limits.
 - Provides an offline preview, setup diagnostics, background start/stop, progress and rotating logs.
+- Supervises the worker process, records heartbeats and daily reports, and raises desktop alerts for blocked or stalled work on Windows.
+- Keeps versioned state with automatic SQLite backups, guarded restore, and explicit contact recovery commands.
+
+This is a **beta**. Automated tests and local checks cover the recovery paths; the [release checklist](docs/RELEASE_CHECKLIST.md) tracks the remaining live, reboot and cross-platform evidence.
 
 ## Requirements
 
@@ -32,9 +36,9 @@ The browser adapter is Chromium-based. Firefox and Safari are not supported. Bra
 4. Supply the CSV path, browser choice and optional message-template JSON when prompted. Setup creates a virtual environment, installs the app, installs Chromium if selected, and checks the inputs.
 5. Review the generated **messages.json** and **settings.json**. Use your own contacts CSV; input spreadsheets are kept local and are not included in this repository.
 6. Open **Start LinkedIn Outreach.cmd**. Choose **1** to sign in, then **2** to preview your messages.
-7. Choose **5** to start background automation. You can close the menu window after it starts.
+7. Choose **5** to start supervised background automation. You can close the menu window after it starts. Choose **8** to also register startup after you sign into Windows.
 
-Use **Show Outreach Progress.cmd** to check progress and **Stop LinkedIn Outreach.cmd** to stop. **Run in Background.cmd** starts the same background worker directly.
+Use **Show Outreach Progress.cmd** to check progress and **Stop LinkedIn Outreach.cmd** to pause. **Run in Background.cmd** starts the same supervisor directly. An explicit pause survives a worker crash and the next Windows login; start again when ready.
 
 The initial campaign cap is **one invitation total**, even across restarts and subsequent days. Review the result before increasing `campaign_invitation_limit` and the daily/weekly caps in your private settings. These caps are local controls, not LinkedIn-approved thresholds.
 
@@ -53,7 +57,7 @@ linkedin-outreach install-browser
 linkedin-outreach doctor
 linkedin-outreach login
 linkedin-outreach preview --limit 3
-linkedin-outreach start --live
+linkedin-outreach supervise --live
 ```
 
 On Windows, the equivalent installation commands are:
@@ -89,7 +93,7 @@ Supply your own contacts CSV. A minimal header is `Full Name,Company,LinkedIn Pr
 | Optional location | `City`, `State or Province`, `state`, `region`, `Country` | Uses city, then state/region. Missing location uses the location-free note. |
 | Optional title | `Job Title`, `title`, `position` | Stored for reference. |
 
-Names are not globally title-cased, and missing surnames or locations are not invented. Duplicate URLs merge complementary fields while preserving the first supplied nonempty value. Conflicts and invalid URLs appear in `.local/csv-cleanup-report.json`. Ambiguous duplicate headers or broken quoting need correction before import. Source job/company information is not independently verified for freshness.
+Names are not globally title-cased, and missing surnames or locations are not invented. Duplicate URLs merge complementary fields while preserving the first supplied nonempty value. Conflicts and invalid URLs appear in `csv-cleanup-report.json` inside your private state directory. Ambiguous duplicate headers or broken quoting need correction before import. Source job/company information is not independently verified for freshness.
 
 Changing a CSV imports new profiles and updates contact details; it preserves existing send history and sequence states. Removing a row does **not** cancel a sequence already started. Use `stop LEAD_ID` to cancel it. Stop the worker before changing inputs/settings, then start again.
 
@@ -119,7 +123,7 @@ The default profile lives under your user's local application-data directory (`L
 
 ## Timing and limits
 
-The default watcher checks every 30 minutes, Monday–Friday, 9am–6pm in `America/New_York`. It schedules Message 1 **24 hours after acceptance is first observed**, and Message 2 **72 hours after Message 1 was actually sent**. The precise time of acceptance is not inferred. Any reply, manual conversation or unreadable history stops that person's automated sequence.
+The default watcher checks every 30 minutes, Monday–Friday, 9am–6pm in `America/New_York`. It schedules Message 1 **24 hours after acceptance is first observed**, and Message 2 **72 hours after Message 1 was actually sent**. The precise time of acceptance is not inferred. Any reply, manual conversation or unreadable history stops that person's automated sequence. Working hours, quotas and minimum spacing are checked again immediately before Connect and Send; spacing starts from the previous confirmed completion or uncertain outcome.
 
 Useful settings in [settings.example.json](settings.example.json):
 
@@ -131,16 +135,36 @@ Useful settings in [settings.example.json](settings.example.json):
 | `working_days`, `working_hours`, `timezone` | Watcher schedule. Monday is 0; end hour is exclusive. |
 | `message_1_delay_days`, `message_2_delay_days` | Delays after observed acceptance and Message 1. |
 | `company_filter` | Exact company filter for new invitations; active follow-ups continue. |
-| `state_directory` | Private campaign database, normalized CSV, reports and logs. |
+| `state_directory` | Private campaign database, normalized CSV, reports and logs; new setup uses `auto` outside the repository. |
 | `message_templates_file` | Your separate JSON templates; inline templates also work. |
 | `read_attempts` | Read-only navigation/history attempts per check; default 2, maximum 5. Connect and Send clicks are never retried. |
 | `contact_retry_limit` | Failed checks across cycles before holding a contact; default 3, persisted across restarts. |
 | `retry_initial_seconds`, `retry_max_seconds` | Exponential retry/cooldown range; defaults 60 and 1800 seconds. |
 | `max_consecutive_failures` | Contact failures before cooling down and opening a fresh browser; default 3. |
+| `heartbeat_interval_seconds`, `stalled_after_seconds` | Health snapshots and stalled-progress detection; defaults 30 and 300 seconds. |
+| `desktop_notifications`, `notification_cooldown_minutes` | Windows desktop alerts and repeat-alert cooldown; defaults `true` and 30 minutes. Alerts are also saved locally. |
+| `backup_interval_hours`, `backup_retention` | Automatic snapshot interval and number of completed backups retained; defaults 24 hours and 14. |
 
 Relative paths resolve beside `settings.json`, not beside the installed Python package. Select another settings file with `linkedin-outreach --settings /path/settings.json COMMAND`. Use a separate `state_directory` for a genuinely separate campaign; keep it unchanged when upgrading to retain duplicate protection.
 
-The computer must remain awake, online and signed into the OS. A background worker survives closing the terminal, but does not start itself after reboot. `run --live` executes one cycle immediately, including outside working hours. `watch --live` runs in the foreground; `start --live` detaches it. No actions run while the computer is asleep.
+The computer must remain awake, online and signed into the OS. `supervise --live` runs a hidden parent process that restarts a terminated worker. On Windows, `install-startup --live` also registers a current-user [Task Scheduler logon trigger](https://learn.microsoft.com/en-us/windows/win32/taskschd/logontrigger), using `pythonw.exe` without administrator rights or a stored password. It starts after OS sign-in, not while signed out. macOS/Linux startup registration is not supplied; launch the supervisor yourself or manage it with your OS tools.
+
+`run --live` executes one cycle immediately, including outside working hours. `watch --live` runs in the foreground; `start --live` detaches one worker without a parent supervisor. No actions run while the computer is asleep.
+
+### State location and upgrades
+
+New `init` setups use `state_directory: "auto"`: `%LOCALAPPDATA%/LinkedInOutreach/campaigns/<workspace-id>` on Windows, `~/Library/Application Support/LinkedInOutreach/campaigns/<workspace-id>` on macOS, or `$XDG_DATA_HOME/LinkedInOutreach/campaigns/<workspace-id>` on Linux (falling back to `~/.local/share`). Run `status` to see the resolved path. Each workspace gets its own campaign; preserve that path and your settings when moving or upgrading an existing campaign.
+
+Older settings without this field continue using `.local` for compatibility. To copy existing state out of a synced source folder, stop the supervisor and worker, then run:
+
+```bash
+linkedin-outreach stop-supervisor
+linkedin-outreach migrate-state
+```
+
+Wait for `status` to show both processes stopped first. Migration uses a consistent database snapshot, preserves the old copy, and updates only `state_directory` in your private settings. `--destination /absolute/local/path` chooses another empty directory. Login profiles stay separate. Do not start the retained old campaign copy: it would have stale send history.
+
+Before an upgrade, stop both processes and run `backup`. Install the reviewed version, run `doctor` and `preview`, then `supervise --live`. Schema upgrades take a backup before changing existing databases. An older application refuses a newer database schema; do not force an application downgrade against that database.
 
 ## Recovery and reliability
 
@@ -155,9 +179,15 @@ The background watcher supervises browser cycles. A slow page gets bounded read-
 | Login, verification, invitation/account limit | Stop with `blocked` status for manual attention. No automatic challenge or limit bypass. |
 | Invalid configuration, damaged/unwritable database, unexpected programming error | Stop with an explicit failure; these need repair rather than repeated send attempts. |
 
-Repeated errors open a circuit breaker so a changed layout does not immediately run through the CSV. `status` shows whether the worker is working, waiting, outside working hours, recovering, blocked or failed, along with the retry time and error when relevant. Private `.local/worker-status.json` contains the same health information. Stop requests interrupt cooldown waits.
+Repeated errors open a circuit breaker so a changed layout does not immediately run through the CSV. `status` shows whether the worker is working, waiting, outside working hours, recovering, blocked or failed, along with the retry time and error when relevant. Private `worker-status.json` contains the same health information. Stop requests interrupt cooldown waits.
 
-The watcher can recover a browser failure while its Python process is alive. It is not an OS service: reboot, process termination or sleep requires the documented local start/resume workflow. Live layouts and account behavior still need ongoing validation; passing fixtures is not an assurance of unattended compatibility with every LinkedIn variant.
+The parent supervisor restarts an exited worker while the saved intent is running. It preserves explicit pauses and latches account blocks or fatal failures until you repair the cause and explicitly start again. It alerts on a live but stalled worker instead of force-killing a possible send. The Windows logon task restarts supervision after OS login. Live layouts and account behavior still need ongoing validation; passing fixtures does not establish unattended compatibility with every LinkedIn variant.
+
+### Health, alerts and daily reports
+
+`health` prints worker, supervisor, heartbeat, progress, control and backup details. Windows desktop alerts use [NotifyIcon](https://learn.microsoft.com/en-us/dotnet/api/system.windows.forms.notifyicon), and `test-notification` requests a setup notification. Windows notification settings can suppress the display. On all platforms, alerts are retained in private `alerts.jsonl`; desktop delivery currently supports Windows only. Identical alerts are deduplicated for the configured cooldown.
+
+`report` writes and prints today's private report; `report --date YYYY-MM-DD` chooses a day. It separates confirmed invitations, each follow-up, reserved uncertain/cancelled attempts, remaining allowance and held reasons. Reports are refreshed while watching. A shortfall is compared with the configured invitation ceiling; the app reports known constraints and explicitly marks causes that a snapshot cannot establish. A ceiling is not a promise that every request will be delivered.
 
 ## Commands and troubleshooting
 
@@ -167,8 +197,16 @@ linkedin-outreach preview --limit 3       # Import and render; never send
 linkedin-outreach clean-csv               # Save private normalized CSV and sync metadata
 linkedin-outreach login                   # Visible manual authentication only
 linkedin-outreach start --live            # Detached worker; headless by default
+linkedin-outreach supervise --live        # Detached process supervisor and worker
+linkedin-outreach install-startup --live  # Windows: also start after OS login
 linkedin-outreach status                  # Counts, held leads and worker state
 linkedin-outreach stop-watch              # Graceful stop; current action may finish
+linkedin-outreach stop-supervisor         # Pause worker and stop supervisor
+linkedin-outreach uninstall-startup       # Remove this campaign's Windows logon task
+linkedin-outreach health                  # Machine-readable health details
+linkedin-outreach report                  # Private daily counts and constraints
+linkedin-outreach backup                  # Consistent SQLite snapshot
+linkedin-outreach resume 1                # Requeue a corrected read-only hold
 linkedin-outreach inspect --lead-id 1     # Visible, read-only profile inspection
 linkedin-outreach stop 1                  # Stop one person's sequence, with worker stopped
 ```
@@ -183,7 +221,7 @@ linkedin-outreach stop 1                  # Stop one person's sequence, with wor
 - **Unexpected UI or temporary browser failure:** check `status` for a held contact or automatic recovery time. Repeated layout failures may require an adapter update; do not remove send history to force retries.
 - **Uncertain send:** inspect LinkedIn before resolving it, as described below.
 
-Logs are in `.local/outreach.log` with rotation, plus `watch-output.log` and `watch-error.log` for detached runs. Logs, screenshots and CSV reports can contain contact data. Redact them before sharing. This app has no hosted backend or telemetry; normal browser traffic goes to LinkedIn. Files inside cloud-synced folders follow that folder's sync settings. Prefer a local, unsynced campaign-state directory for database reliability.
+Logs are in your state directory: `outreach.log` with rotation, `watch-output.log` and `watch-error.log` for detached workers, and supervisor logs. Reports and snapshots are under `reports/` and `backups/`. Logs, screenshots and CSV reports can contain contact data. Redact them before sharing. This app has no hosted backend or telemetry; normal browser traffic goes to LinkedIn. Files inside cloud-synced folders follow that folder's sync settings.
 
 ### Resolve an uncertain send
 
@@ -195,7 +233,22 @@ linkedin-outreach reconcile LEAD_ID not-sent
 linkedin-outreach reconcile LEAD_ID stop
 ```
 
-Use `not-sent` only after verifying nothing was sent; it permits a retry. `sent` records the confirmed action, and `stop` ends the sequence. Never delete `.local/outreach.sqlite3` to reset limits: that discards the send history and duplicate protection. Back up this database with the worker stopped before an upgrade.
+Use `not-sent` only after verifying nothing was sent; it permits a retry. `sent` records the confirmed action, and `stop` ends the sequence. Cancelled invitation holds require the same explicit reconciliation. For a corrected identity or exhausted read-only retry, `resume LEAD_ID` clears the hold; it refuses possible sends. Never delete `outreach.sqlite3` to reset limits: that discards the send history and duplicate protection.
+
+### Back up and restore
+
+`backup` uses SQLite's consistent snapshot API and can run while the worker is active. Automatic backups run while watching and retain the configured number of snapshots; keep a separate secure copy if you need protection from disk loss. Private backups contain contacts and messages.
+
+Stop the supervisor and worker before restore. The restore command validates the backup, preserves the existing database, and refuses a readable database replacement that would discard newer/changed actions or replace a different campaign:
+
+```bash
+linkedin-outreach restore /path/to/backup.sqlite3
+# Independently check the restored campaign against LinkedIn and retained history.
+linkedin-outreach acknowledge-restore --confirm-audited
+linkedin-outreach supervise --live
+```
+
+A restored database is latched against sending until that explicit acknowledgment. Restoring from a lost or damaged database cannot reconstruct actions sent after the snapshot; review them independently before acknowledging. Backup restore is not a way to reset quotas or retry uncertain messages.
 
 ## Development and publishing
 
@@ -206,8 +259,9 @@ python -m unittest discover -s tests -v
 python -m unittest discover -s tests -p browser_checks.py -v
 python -m build
 python scripts/check_release.py --dist
+python scripts/smoke_release.py
 ```
 
 Core tests use fake sends; browser tests intercept fixture pages and do not contact LinkedIn. GitHub Actions is configured for Python 3.11/3.13 on Windows, macOS and Ubuntu using bundled Chromium. CI does not use your login or send real outreach. Passing fixtures does not guarantee compatibility with every live LinkedIn layout, account or custom browser installation.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and [the publishing guide](docs/PUBLISHING.md). Spreadsheets, CSVs, the `examples/` folder, private settings, sessions, logs, databases and generated outputs are excluded. The release checker also rejects them in tracked files and distribution packages. Setup generates starter messages locally. Licensed under the [MIT License](LICENSE).
+The release smoke check installs the built wheel into a fresh temporary environment and exercises setup, preview, backup, report, detached start/stop, recovery after terminating its owned fixture worker, and an explicit pause. It stays outside working days and verifies zero actions. It does not need a login or contact LinkedIn. See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), [the release checklist](docs/RELEASE_CHECKLIST.md), and [the publishing guide](docs/PUBLISHING.md). Spreadsheets, CSVs, the `examples/` folder, private settings, sessions, logs, databases and generated outputs are excluded. The release checker also rejects them in tracked files and distribution packages. Setup generates starter messages locally. Licensed under the [MIT License](LICENSE).

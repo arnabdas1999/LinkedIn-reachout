@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 from playwright.sync_api import Error as BrowserError
 
 from outreach_config import VERSION, load_settings, read_json, resolve_path, state_path
-from outreach_errors import (AccountBlocked, ContactNeedsReview, ContactNotReady, InvitationHeld,
+from outreach_errors import (AccountBlocked, ContactNeedsReview, ContactNotReady, CyclePaused, InvitationHeld,
                              RetryCycle, StopRequested, StopRun)
 
 from lead_data import (SOURCE_DATA_REASON, SOURCE_DATA_REASONS, canonical_profile,
@@ -66,33 +66,36 @@ def render(lead, cfg):
 
 class Store:
     def __init__(self, path, readonly=False):
+        existed = Path(path).is_file()
         target = Path(path).resolve().as_uri() + "?mode=ro" if readonly else str(path)
         self.db = sqlite3.connect(target, timeout=10, uri=readonly)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA foreign_keys=ON")
-        if readonly:
-            return
-        self.db.executescript("""
-            CREATE TABLE IF NOT EXISTS leads (
-                id INTEGER PRIMARY KEY, url TEXT NOT NULL UNIQUE,
-                first_name TEXT NOT NULL, full_name TEXT NOT NULL,
-                company TEXT NOT NULL, title TEXT NOT NULL,
-                city TEXT NOT NULL, region TEXT NOT NULL,
-                state TEXT NOT NULL DEFAULT 'new', reason TEXT NOT NULL DEFAULT '',
-                invited_at TEXT, accepted_at TEXT, message_1_at TEXT, message_2_at TEXT,
-                last_checked_at TEXT, next_check_at TEXT
-            );
-            CREATE TABLE IF NOT EXISTS actions (
-                id INTEGER PRIMARY KEY, lead_id INTEGER NOT NULL REFERENCES leads(id),
-                kind TEXT NOT NULL, status TEXT NOT NULL,
-                started_at TEXT NOT NULL, sent_at TEXT, message TEXT NOT NULL,
-                detail TEXT NOT NULL DEFAULT '', UNIQUE(lead_id, kind)
-            );
-        """)
-        columns = {row['name'] for row in self.db.execute('PRAGMA table_info(leads)')}
-        if 'failure_count' not in columns:
-            self.db.execute('ALTER TABLE leads ADD COLUMN failure_count INTEGER NOT NULL DEFAULT 0')
-            self.db.commit()
+        try:
+            self.db.row_factory = sqlite3.Row
+            self.db.execute("PRAGMA foreign_keys=ON")
+            if readonly:
+                return
+            self.db.executescript("""
+                CREATE TABLE IF NOT EXISTS leads (
+                    id INTEGER PRIMARY KEY, url TEXT NOT NULL UNIQUE,
+                    first_name TEXT NOT NULL, full_name TEXT NOT NULL,
+                    company TEXT NOT NULL, title TEXT NOT NULL,
+                    city TEXT NOT NULL, region TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'new', reason TEXT NOT NULL DEFAULT '',
+                    invited_at TEXT, accepted_at TEXT, message_1_at TEXT, message_2_at TEXT,
+                    last_checked_at TEXT, next_check_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS actions (
+                    id INTEGER PRIMARY KEY, lead_id INTEGER NOT NULL REFERENCES leads(id),
+                    kind TEXT NOT NULL, status TEXT NOT NULL,
+                    started_at TEXT NOT NULL, sent_at TEXT, message TEXT NOT NULL,
+                    detail TEXT NOT NULL DEFAULT '', UNIQUE(lead_id, kind)
+                );
+            """)
+            from outreach_state import migrate
+            migrate(self.db, path, existed)
+        except BaseException:
+            self.db.close()
+            raise
 
     def close(self):
         self.db.close()
@@ -173,9 +176,9 @@ class Store:
             if self.db.execute("SELECT 1 FROM actions WHERE lead_id=? AND status IN ('prepared','unknown')", (lead_id,)).fetchone():
                 raise ValueError('This contact has an unresolved send; reconcile it before another action')
             self.db.execute("""
-                INSERT INTO actions (lead_id,kind,status,started_at,message)
-                VALUES (?,?,'prepared',?,?)
-            """, (lead_id, kind, stamp(now), message))
+                INSERT INTO actions (lead_id,kind,status,started_at,quota_at,message)
+                VALUES (?,?,'prepared',?,?,?)
+            """, (lead_id, kind, stamp(now), stamp(now), message))
 
     def sent(self, lead_id, kind, now):
         state, column = {
@@ -185,9 +188,9 @@ class Store:
         }[kind]
         with self.db:
             cursor = self.db.execute("""
-                UPDATE actions SET status='sent',sent_at=? WHERE lead_id=? AND kind=?
-                AND status IN ('prepared','unknown')
-            """, (stamp(now), lead_id, kind))
+                UPDATE actions SET status='sent',sent_at=?,finished_at=?,quota_at=? WHERE lead_id=? AND kind=?
+                AND status IN ('prepared','unknown','cancelled')
+            """, (stamp(now), stamp(now), stamp(now), lead_id, kind))
             if cursor.rowcount != 1:
                 raise ValueError("No pending action to confirm")
             self.db.execute(
@@ -195,33 +198,33 @@ class Store:
                 (state, stamp(now), lead_id),
             )
 
-    def uncertain(self, lead_id, kind, detail):
+    def uncertain(self, lead_id, kind, detail, now=None):
         with self.db:
             self.db.execute("""
-                UPDATE actions SET status='unknown',detail=?
+                UPDATE actions SET status='unknown',detail=?,finished_at=?
                 WHERE lead_id=? AND kind=? AND status='prepared'
-            """, (detail, lead_id, kind))
+            """, (detail, stamp(now or utcnow()), lead_id, kind))
             self.db.execute("UPDATE leads SET state='needs_review',reason=? WHERE id=?",
                             (detail, lead_id))
 
-    def hold_invitation(self, lead_id, detail):
+    def hold_invitation(self, lead_id, detail, now=None):
         # Keep the attempt in the journal and quota, without requeueing it.
         # Only a freshly verified profile still offering Connect qualifies.
         with self.db:
             cursor = self.db.execute("""
-                UPDATE actions SET status='cancelled',detail=?
+                UPDATE actions SET status='cancelled',detail=?,finished_at=?
                 WHERE lead_id=? AND kind='invite' AND status='prepared'
-            """, (detail, lead_id))
+            """, (detail, stamp(now or utcnow()), lead_id))
             if cursor.rowcount != 1:
                 raise ValueError("No prepared invitation to hold")
             self.db.execute("UPDATE leads SET state='needs_review',reason=? WHERE id=?",
                             (detail, lead_id))
 
-    def recover(self):
+    def recover(self, now=None):
         rows = self.db.execute("SELECT * FROM actions WHERE status='prepared'").fetchall()
         for row in rows:
             self.uncertain(row["lead_id"], row["kind"],
-                           "Previous run stopped during a send. Check LinkedIn before reconciling.")
+                           "Previous run stopped during a send. Check LinkedIn before reconciling.", now)
         with self.db:
             self.db.execute("""UPDATE leads SET state='needs_review',reason=(
                 SELECT detail FROM actions WHERE lead_id=leads.id AND status='unknown' ORDER BY id DESC LIMIT 1)
@@ -236,18 +239,38 @@ class Store:
     def unresolved(self):
         return self.db.execute("SELECT count(*) FROM actions WHERE status IN ('prepared','unknown')").fetchone()[0]
 
-    def used(self, kind, since=None):
+    def used(self, kind, since=None, exclude=None):
         sql = "SELECT count(*) FROM actions WHERE status IN ('prepared','unknown','sent','cancelled')"
         args = []
         sql += " AND " + ("kind='invite'" if kind == "invite" else "kind IN ('message_1','message_2')")
         if since:
-            sql += " AND started_at>=?"
+            sql += " AND coalesce(quota_at,started_at)>=?"
             args.append(stamp(since))
+        if exclude:
+            sql += ' AND NOT (lead_id=? AND kind=?)'
+            args.extend(exclude)
         return self.db.execute(sql, args).fetchone()[0]
 
-    def last_send(self):
-        value = self.db.execute("SELECT max(started_at) FROM actions WHERE status IN ('prepared','unknown','sent','cancelled')").fetchone()[0]
+    def last_send(self, exclude=None):
+        sql = "SELECT max(coalesce(finished_at,sent_at,started_at)) FROM actions WHERE status IN ('prepared','unknown','sent','cancelled')"
+        args = ()
+        if exclude:
+            sql += ' AND NOT (lead_id=? AND kind=?)'
+            args = exclude
+        value = self.db.execute(sql, args).fetchone()[0]
         return parsed(value)
+
+    def click_started(self, lead_id, kind, now):
+        with self.db:
+            cursor = self.db.execute("UPDATE actions SET click_started_at=coalesce(click_started_at,?),quota_at=? WHERE lead_id=? AND kind=? AND status='prepared'",
+                            (stamp(now), stamp(now), lead_id, kind))
+            if cursor.rowcount != 1:
+                raise ValueError('No journal reservation for the requested click')
+
+    def release_unstarted(self, lead_id, kind):
+        with self.db:
+            row = self.db.execute("DELETE FROM actions WHERE lead_id=? AND kind=? AND status='prepared' AND click_started_at IS NULL", (lead_id, kind))
+            return row.rowcount == 1
 
     def sent_messages(self, lead_id):
         return {row["kind"]: row["message"] for row in self.db.execute(
@@ -256,11 +279,11 @@ class Store:
 
     def reconcile(self, lead_id, outcome, now):
         row = self.db.execute("""
-            SELECT * FROM actions WHERE lead_id=? AND status='unknown'
+            SELECT * FROM actions WHERE lead_id=? AND status IN ('unknown','cancelled')
             ORDER BY id DESC LIMIT 1
         """, (lead_id,)).fetchone()
         if row is None:
-            raise ValueError("This lead has no uncertain send to reconcile")
+            raise ValueError("This lead has no uncertain or cancelled send to reconcile")
         if outcome == "sent":
             self.sent(lead_id, row["kind"], parsed(row["started_at"]))
         elif outcome == "not-sent":
@@ -268,7 +291,7 @@ class Store:
             state = {"invite": "new", "message_1": "accepted", "message_2": "message_1_sent"}[row["kind"]]
             with self.db:
                 self.db.execute("DELETE FROM actions WHERE id=?", (row["id"],))
-                self.db.execute("UPDATE leads SET state=?,reason='',next_check_at=NULL WHERE id=?", (state, lead_id))
+                self.db.execute("UPDATE leads SET state=?,reason='',failure_count=0,next_check_at=NULL WHERE id=?", (state, lead_id))
         else:
             with self.db:
                 self.db.execute("UPDATE actions SET status='cancelled',detail='Stopped by operator' WHERE id=?", (row["id"],))
@@ -306,15 +329,44 @@ def working_time(now, cfg):
 
 
 class Campaign:
-    def __init__(self, store, cfg, browser, now=utcnow, pause=time.sleep, stop_requested=None):
+    def __init__(self, store, cfg, browser, now=utcnow, pause=time.sleep, stop_requested=None, enforce_schedule=False):
         self.store, self.cfg, self.browser = store, cfg, browser
         self.now, self.pause = now, pause
         self.stop_requested = stop_requested or (lambda: False)
         self.consecutive_failures = 0
+        self.enforce_schedule = enforce_schedule
 
     def check_stop(self):
         if self.stop_requested():
             raise StopRequested("Stop requested. Progress is saved.")
+        from outreach_monitor import progress
+        progress(state_path(self.cfg), self.now()) if self.cfg.get('_progress_enabled') else None
+
+    def preflight(self, lead, kind, mark_click=False):
+        from outreach_state import meta
+        if meta(self.store.db, 'restore_review_required') == '1':
+            raise AccountBlocked('Restored state requires an explicit audit acknowledgment before sending')
+        exclude = (lead['id'], kind)
+        last = self.store.last_send(exclude)
+        if last:
+            remaining = self.cfg['minimum_seconds_between_sends'] - (self.now() - last).total_seconds()
+            if remaining > 0:
+                self.pause(remaining)
+        self.check_stop()
+        now = self.now()
+        if self.enforce_schedule and not working_time(now, self.cfg):
+            raise CyclePaused('Working window closed before a send; waiting for the next scheduled cycle')
+        category = 'invite' if kind == 'invite' else 'message'
+        daily = self.cfg['invitations_per_day'] if kind == 'invite' else self.cfg['messages_per_day']
+        if self.store.used(category, day_start(now, self.cfg), exclude) >= daily:
+            raise CyclePaused('Daily send allowance exhausted before click')
+        if kind == 'invite':
+            total = self.cfg['campaign_invitation_limit']
+            if (self.store.used('invite', now - timedelta(days=7), exclude) >= self.cfg['invitations_per_7_days'] or
+                    (total is not None and self.store.used('invite', exclude=exclude) >= total)):
+                raise CyclePaused('Invitation allowance exhausted before click')
+        if mark_click:
+            self.store.click_started(lead['id'], kind, now)
 
     def failed(self, lead, detail, *, temporary=False):
         count = self.store.lead(lead['id'])['failure_count'] + 1
@@ -360,15 +412,11 @@ class Campaign:
         return None
 
     def send(self, lead, kind):
-        self.check_stop()
-        last = self.store.last_send()
-        if last:
-            remaining = self.cfg['minimum_seconds_between_sends'] - (self.now() - last).total_seconds()
-            if remaining > 0:
-                self.pause(remaining)
-        self.check_stop()
+        self.preflight(lead, kind)
         message = render(lead, self.cfg)[kind]
         self.store.begin(lead['id'], kind, message, self.now())
+        previous_guard = getattr(self.browser, 'before_action', None)
+        self.browser.before_action = lambda: self.preflight(lead, kind, mark_click=True)
         try:
             if kind == 'invite':
                 self.browser.send_invitation(lead, message)
@@ -377,27 +425,33 @@ class Campaign:
             self.store.sent(lead['id'], kind, self.now())
         except InvitationHeld as exc:
             if kind != 'invite':
-                self.store.uncertain(lead['id'], kind, str(exc))
+                self.store.uncertain(lead['id'], kind, str(exc), self.now())
             else:
-                self.store.hold_invitation(lead['id'], str(exc))
+                self.store.hold_invitation(lead['id'], str(exc), self.now())
             self.failed(lead, str(exc))
             return False
+        except CyclePaused as exc:
+            if not self.store.release_unstarted(lead['id'], kind):
+                self.store.uncertain(lead['id'], kind, str(exc), self.now())
+            raise
         except (AccountBlocked, StopRequested, KeyboardInterrupt, SystemExit) as exc:
-            self.store.uncertain(lead['id'], kind, str(exc) or type(exc).__name__)
+            self.store.uncertain(lead['id'], kind, str(exc) or type(exc).__name__, self.now())
             raise
         except (ContactNeedsReview, ContactNotReady, StopRun, BrowserError, TimeoutError, ConnectionError) as exc:
-            self.store.uncertain(lead['id'], kind, str(exc) or type(exc).__name__)
+            self.store.uncertain(lead['id'], kind, str(exc) or type(exc).__name__, self.now())
             self.failed(lead, 'Send outcome unknown; never automatically retry: ' + str(exc))
             return False
         except BaseException as exc:
-            self.store.uncertain(lead['id'], kind, str(exc) or type(exc).__name__)
+            self.store.uncertain(lead['id'], kind, str(exc) or type(exc).__name__, self.now())
             raise
+        finally:
+            self.browser.before_action = previous_guard
         self.succeeded(lead)
         LOG.info('SENT %s to %s at %s', kind, lead['full_name'], lead['company'])
         return True
 
     def run(self):
-        self.store.recover()
+        self.store.recover(self.now())
         messages = message_attempts = 0
         for lead in self.store.active_due(self.now(), self.cfg['acceptance_checks_per_run']):
             state = self.read(lead, lambda: self.browser.open_profile(lead))
@@ -545,10 +599,13 @@ def browser_session(cfg, *, visible=False):
 
 
 def browser_cycle(store, cfg, stop_path):
+    from outreach_state import meta
+    if meta(store.db, 'restore_review_required') == '1':
+        raise AccountBlocked('Restored state requires independent audit acknowledgment before sending')
     with browser_session(cfg) as browser:
         browser.require_login()
         return Campaign(store, cfg, browser, pause=lambda seconds: wait_for_stop(stop_path, seconds),
-                        stop_requested=stop_path.exists).run()
+                        stop_requested=stop_path.exists, enforce_schedule=True).run()
 
 
 def main(argv=None):
@@ -561,6 +618,7 @@ def main(argv=None):
     init.add_argument("--messages", type=Path)
     init.add_argument("--browser", choices=("chromium", "chrome", "msedge", "brave"))
     init.add_argument("--timezone", default="America/New_York")
+    init.add_argument('--state-directory', default='auto')
     sub.add_parser("doctor", help="Validate CSV, templates, paths and browser installation offline")
     sub.add_parser("install-browser", help="Install bundled Chromium if selected; keep branded browsers unchanged")
     start = sub.add_parser("start", help="Start a detached background watcher")
@@ -570,6 +628,7 @@ def main(argv=None):
     sub.add_parser("status")
     sub.add_parser("clean-csv", help="Clean the source CSV and sync repairs, without opening LinkedIn")
     sub.add_parser("stop-watch", help="Stop the watcher after its current action; never force-kill a send")
+    sub.add_parser('stop-supervisor', help='Pause outreach and stop its process supervisor gracefully')
     sub.add_parser("login")
     inspect = sub.add_parser("inspect", help="Check a profile in browser; do not connect or send")
     inspect.add_argument("--lead-id", type=int, help="Inspect a specific tracked lead without changing its state")
@@ -581,6 +640,23 @@ def main(argv=None):
     reconcile.add_argument("outcome", choices=("sent", "not-sent", "stop"))
     stop = sub.add_parser("stop", help="Stop the sequence for a lead")
     stop.add_argument("lead_id", type=int)
+    sub.add_parser('backup', help='Create and validate a consistent SQLite snapshot')
+    restore = sub.add_parser('restore', help='Restore a backup with a mandatory audit latch')
+    restore.add_argument('backup_file', type=Path)
+    acknowledge = sub.add_parser('acknowledge-restore', help='Confirm independent review of restored send history')
+    acknowledge.add_argument('--confirm-audited', action='store_true')
+    resume = sub.add_parser('resume', help='Resume a held read-only check; refuses possible/cancelled sends')
+    resume.add_argument('lead_id', type=int)
+    report = sub.add_parser('report', help='Write a private daily report')
+    report.add_argument('--date')
+    sub.add_parser('health')
+    sub.add_parser('test-notification')
+    for name in ('supervise', 'install-startup'):
+        item = sub.add_parser(name)
+        item.add_argument('--live', action='store_true')
+    sub.add_parser('uninstall-startup')
+    move = sub.add_parser('migrate-state', help='Copy campaign state to a new unsynced directory and update settings')
+    move.add_argument('--destination', type=Path)
     args = parser.parse_args(argv)
     from outreach_setup import doctor, initialize, install_browser, prepare_source, start_worker, worker_running
     store = None
@@ -590,14 +666,18 @@ def main(argv=None):
     try:
         if args.command == "init":
             return initialize(args)
-        if args.command == "stop-watch":
+        if args.command in ('stop-watch', 'stop-supervisor'):
             # Stopping must still work if a template file was moved or edited
             # incorrectly while the running worker uses its cached settings.
             settings_path = args.settings.expanduser().resolve()
             raw = read_json(settings_path) if settings_path.is_file() else {}
-            directory = resolve_path(raw.get("state_directory", ".local"), settings_path.parent)
+            directory = state_path({'state_directory': raw.get('state_directory', '.local'), '_workspace': str(settings_path.parent)})
             directory.mkdir(parents=True, exist_ok=True)
             (directory / "stop-watch.request").write_text(stamp(utcnow()), encoding="utf-8")
+            from outreach_service import control
+            control(directory, 'paused')
+            if args.command == 'stop-supervisor':
+                (directory / 'stop-supervisor.request').write_text(stamp(utcnow()))
             print("Stop requested. A current browser action may finish first. Saved progress is kept.")
             return 0
         cfg = load_settings(args.settings)
@@ -610,8 +690,55 @@ def main(argv=None):
             handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
             LOG.addHandler(handler)
         stop_path = directory / "stop-watch.request"
+        if args.command in ('health', 'report', 'test-notification'):
+            from outreach_monitor import daily_report, desktop_notification, read_status
+            if args.command == 'test-notification':
+                print('Notification requested:', desktop_notification('LinkedIn Outreach', 'Desktop alerts are configured. This is a setup check.'))
+            elif args.command == 'report':
+                from datetime import date
+                print(json.dumps(daily_report(directory, cfg, date.fromisoformat(args.date) if args.date else None), indent=2))
+            else:
+                details = {name: read_status(directory / (name + '.json')) for name in
+                           ('worker-status', 'heartbeat', 'progress', 'backup-status', 'supervisor-status', 'control')}
+                details.update(state_directory=str(directory), worker_running=worker_running(directory),
+                               supervisor_running=worker_running(directory, lock_name='supervisor.lock'))
+                print(json.dumps(details, indent=2))
+            return 0
+        if args.command in ('supervise', 'install-startup', 'uninstall-startup'):
+            from outreach_service import control, install_startup, start_supervisor, uninstall_startup
+            if args.command == 'uninstall-startup':
+                uninstall_startup(cfg)
+                (directory / 'stop-supervisor.request').write_text(stamp(utcnow()))
+                print('Login startup removed; current worker can be stopped with stop-watch.')
+            else:
+                if not args.live:
+                    raise ValueError('Supervision/startup requires --live')
+                if args.command == 'install-startup':
+                    print('Installed current-user logon task:', install_startup(cfg))
+                control(directory, 'running')
+                start_supervisor(cfg)
+                print('Process supervision enabled; account blocks and explicit pauses remain latched.')
+            return 0
+        if args.command == 'backup':
+            from outreach_state import backup_database
+            print(backup_database(directory / 'outreach.sqlite3'))
+            return 0
+        if args.command == 'migrate-state':
+            from outreach_state import migrate_directory
+            print('New campaign state:', migrate_directory(cfg, args.destination))
+            return 0
+        if args.command == 'restore':
+            from outreach_state import restore_database
+            from outreach_service import control
+            with ProcessLock(directory / 'process.lock'):
+                control(directory, 'paused')
+                restore_database(args.backup_file, directory / 'outreach.sqlite3')
+            print('Restored. Sending is latched off until acknowledge-restore --confirm-audited after independent review.')
+            return 0
         if args.command == "status":
             print("Worker:", "running" if worker_running(directory) else "stopped")
+            print('State directory:', directory)
+            print('Process supervisor:', 'running' if worker_running(directory, lock_name='supervisor.lock') else 'stopped')
             health = directory / 'worker-status.json'
             if health.is_file():
                 try:
@@ -647,7 +774,7 @@ def main(argv=None):
                 return 0
             store = Store(directory / "outreach.sqlite3")
             # State-only commands also work when the source CSV has been moved.
-            if args.command in ("stop", "reconcile"):
+            if args.command in ("stop", "reconcile", 'resume', 'acknowledge-restore'):
                 cleanup = None
             else:
                 cleaned, cleanup = prepare_source(cfg, directory)
@@ -657,7 +784,17 @@ def main(argv=None):
                 imported = store.import_csv(cleaned)
                 LOG.info("CSV: %s", imported)
             store.recover()
-            if args.command == "clean-csv":
+            if args.command == 'resume':
+                from outreach_state import resume_contact
+                resume_contact(store, args.lead_id)
+                print('Held contact requeued for a fresh identity/history check.')
+            elif args.command == 'acknowledge-restore':
+                from outreach_state import meta
+                if not args.confirm_audited:
+                    raise ValueError('Review send history independently, then pass --confirm-audited')
+                meta(store.db, 'restore_review_required', '0')
+                print('Restore audit acknowledged. Use start --live to resume explicitly.')
+            elif args.command == "clean-csv":
                 print(json.dumps({"rows": cleanup["output_rows"], "field_repairs": len(cleanup["changes"]),
                                   "duplicates_removed": cleanup["duplicates_removed"], "cleaned_file": cleanup["cleaned_file"], **imported}, indent=2))
                 show_status(store)
@@ -689,7 +826,14 @@ def main(argv=None):
                     LOG.info("Watching weekdays/hours %s/%s, timezone %s; headless=%s. stop-watch requests shutdown.", cfg["working_days"], cfg["working_hours"], cfg["timezone"], cfg["headless"])
                     (directory / "watcher-ready.json").write_text(json.dumps({"pid": os.getpid(), "started_at": stamp(utcnow())}), encoding="utf-8")
                     watch_started = True
-                    watch_worker(cfg, directory, run_cycle=lambda: browser_cycle(store, cfg, stop_path),
+                    from outreach_monitor import Monitor
+                    from outreach_worker import worker_status
+                    from outreach_monitor import progress
+                    cfg['_progress_enabled'] = True
+                    worker_status(directory, 'starting', utcnow())
+                    progress(directory, utcnow())
+                    with Monitor(cfg, directory):
+                        watch_worker(cfg, directory, run_cycle=lambda: browser_cycle(store, cfg, stop_path),
                                  has_work=lambda: bool(store.active_due(utcnow(), 1)) or (
                                      invite_capacity(store, cfg, utcnow()) > 0 and bool(store.candidates(cfg.get('company_filter', '')))),
                                  is_finished=lambda: campaign_finished(store, cfg), next_retry=store.next_retry,
@@ -726,6 +870,9 @@ def main(argv=None):
         return 130
     except StopRequested as exc:
         LOG.info("%s", exc)
+        return 0
+    except CyclePaused as exc:
+        LOG.info('%s', exc)
         return 0
     except Exception as exc:
         if log_handlers:

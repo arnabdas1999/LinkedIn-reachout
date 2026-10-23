@@ -31,6 +31,8 @@ class SetupTests(unittest.TestCase):
         return load_settings(self.settings)
 
     def cli(self, *args):
+        if args and args[0] == 'init':
+            args = (*args, '--state-directory', str(self.root / '.local'))
         output = io.StringIO()
         with redirect_stdout(output), redirect_stderr(output):
             result = main(["--settings", str(self.settings), *args])

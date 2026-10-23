@@ -25,6 +25,10 @@ class RetryCycle(StopRun):
     """Discard this browser session and resume after a cooldown."""
 
 
+class CyclePaused(StopRun):
+    """Schedule/quota changed before a click; wait for the next eligible cycle."""
+
+
 class ProfileNeedsReview(ContactNeedsReview):
     """A selected profile's identity cannot be verified before starting an action."""
 

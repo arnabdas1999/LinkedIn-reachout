@@ -14,7 +14,7 @@ from playwright.sync_api import sync_playwright
 
 from linkedin_browser import LinkedInBrowser, brave_executable
 from outreach import StopRun
-from outreach_errors import InvitationFormMissing, InvitationHeld, ProfileNeedsReview
+from outreach_errors import CyclePaused, InvitationFormMissing, InvitationHeld, ProfileNeedsReview
 
 URL = "https://www.linkedin.com/in/alex/"
 LEAD = {"id": 1, "url": URL, "first_name": "Alex", "full_name": "Alex Example", "company": "Oracle"}
@@ -115,6 +115,41 @@ class BrowserChecks(unittest.TestCase):
         self.assertEqual(self.page.evaluate("window.invitationText"), NOTE)
         self.assertEqual(self.page.evaluate("window.sends"), 1)
         self.assertEqual(self.adapter.profile_state(), "pending")
+
+    def test_action_guards_run_before_both_connect_and_final_send(self):
+        self.fixture()
+        calls = []
+        self.adapter.before_action = lambda: calls.append(self.page.evaluate('window.sends || 0'))
+        self.adapter.send_invitation(LEAD, NOTE)
+        self.assertEqual(calls, [0, 0])
+        self.assertEqual(self.page.evaluate('window.sends'), 1)
+
+    def test_busy_renderer_dispatches_connect_once_without_premature_timeout(self):
+        self.fixture()
+        self.page.evaluate('''document.querySelector('#connect').addEventListener('mousedown', () => {
+            window.connectInputs = (window.connectInputs || 0) + 1;
+            const until = performance.now() + 1800;
+            while (performance.now() < until) { /* simulate a busy live renderer */ }
+        }, {once: true})''')
+        self.adapter.send_invitation(LEAD, NOTE)
+        self.assertEqual(self.page.evaluate('window.connectInputs'), 1)
+        self.assertEqual(self.page.evaluate('window.sends'), 1)
+
+    def test_guard_denial_before_connect_does_not_send_or_open_composer(self):
+        self.fixture()
+        self.adapter.before_action = lambda: (_ for _ in ()).throw(CyclePaused('Window closed'))
+        with self.assertRaises(CyclePaused):
+            self.adapter.send_invitation(LEAD, NOTE)
+        self.assertIsNone(self.page.evaluate('window.sends'))
+        self.assertFalse(self.page.locator('dialog').is_visible())
+
+    def test_guard_denial_before_message_send_clears_only_its_own_draft(self):
+        self.fixture('1st', event(NOTE))
+        self.adapter.before_action = lambda: (_ for _ in ()).throw(CyclePaused('Window closed'))
+        with self.assertRaises(CyclePaused):
+            self.adapter.send_message(LEAD, MESSAGE, {'invite': NOTE})
+        self.assertIsNone(self.page.evaluate('window.sends'))
+        self.assertEqual(self.page.locator('[contenteditable]').inner_text().strip(), '')
 
     def test_more_menu_retries_only_read_only_open_when_first_click_is_not_ready(self):
         def hydration(html):

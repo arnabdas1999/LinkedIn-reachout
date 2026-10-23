@@ -4,9 +4,11 @@ from datetime import datetime
 import io
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from outreach import Store, main, working_time, utcnow
@@ -29,8 +31,14 @@ class BackgroundTests(unittest.TestCase):
             self.assertFalse(working_time(utcnow(), cfg))
             output = io.StringIO()
             state = root / '.local'
+            children = []
+            real_popen = subprocess.Popen
+            def launch(*args, **kwargs):
+                child = real_popen(*args, **kwargs)
+                children.append(child)
+                return child
             try:
-                with redirect_stdout(output), redirect_stderr(output):
+                with redirect_stdout(output), redirect_stderr(output), patch('outreach_setup.subprocess.Popen', side_effect=launch):
                     result = main(['--settings', str(settings), 'start', '--live'])
                 self.assertEqual(result, 0, output.getvalue())
                 self.assertTrue(worker_running(state))
@@ -54,6 +62,10 @@ class BackgroundTests(unittest.TestCase):
                     deadline = time.monotonic() + 15
                     while worker_running(state) and time.monotonic() < deadline:
                         time.sleep(0.2)
+                # The campaign lock is released before Python finishes closing
+                # stdio. Wait for our launcher too before removing Windows logs.
+                for child in children:
+                    child.wait(timeout=15)
 
     def test_release_guard_rejects_private_inputs_and_state(self):
         for path in ('settings.json', 'my/contacts.csv', '.local/outreach.sqlite3',

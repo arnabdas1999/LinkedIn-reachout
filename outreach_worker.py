@@ -7,7 +7,7 @@ import os
 
 from playwright.sync_api import Error as BrowserError
 
-from outreach_errors import AccountBlocked, RetryCycle, StopRequested
+from outreach_errors import AccountBlocked, CyclePaused, RetryCycle, StopRequested
 
 LOG = logging.getLogger('outreach')
 
@@ -17,12 +17,11 @@ def retry_delay(cfg, failures):
 
 
 def worker_status(directory, phase, now, *, error='', next_retry=None, failures=0):
-    data = dict(phase=phase, pid=os.getpid(), updated_at=now.astimezone(timezone.utc).isoformat(timespec='seconds'),
+    data = dict(phase=phase, pid=os.getpid(), updated_at=now.astimezone(timezone.utc).isoformat(),
                 last_error=error, consecutive_cycle_failures=failures,
                 next_retry_at=next_retry.astimezone(timezone.utc).isoformat(timespec='seconds') if next_retry else None)
-    pending = directory / 'worker-status.tmp'
-    pending.write_text(json.dumps(data, indent=2), encoding='utf-8')
-    pending.replace(directory / 'worker-status.json')
+    from outreach_monitor import atomic_json
+    atomic_json(directory / 'worker-status.json', data)
 
 
 def watch_worker(cfg, directory, *, run_cycle, has_work, is_finished, next_retry, now, wait, stop_requested):
@@ -37,6 +36,11 @@ def watch_worker(cfg, directory, *, run_cycle, has_work, is_finished, next_retry
                 worker_status(directory, 'working', now())
                 try:
                     result = run_cycle()
+                except CyclePaused as exc:
+                    worker_status(directory, 'waiting', now(), error=str(exc), next_retry=now() + timedelta(seconds=delay))
+                    if wait(delay):
+                        break
+                    continue
                 except (RetryCycle, BrowserError, TimeoutError, ConnectionError) as exc:
                     failures += 1
                     delay = retry_delay(cfg, failures)

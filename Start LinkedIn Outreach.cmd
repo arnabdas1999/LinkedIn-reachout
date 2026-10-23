@@ -18,12 +18,14 @@ echo 1. Sign in - opens your selected browser
 echo 2. Preview messages - no sending
 echo 3. Check setup - no LinkedIn activity
 echo 4. Run once - LIVE, uses configured limits
-echo 5. Start background automation - LIVE, browser stays hidden
+echo 5. Start supervised background automation - LIVE, browser stays hidden
 echo 6. Show progress
 echo 7. Stop background automation
-echo 8. Exit
-choice /c 12345678 /n /m "Choose 1-8: "
-if errorlevel 8 exit /b 0
+echo 8. Enable startup after Windows login - LIVE
+echo 9. Exit
+choice /c 123456789 /n /m "Choose 1-9: "
+if errorlevel 9 exit /b 0
+if errorlevel 8 goto startup
 if errorlevel 7 goto stop
 if errorlevel 6 goto status
 if errorlevel 5 goto watch
@@ -44,7 +46,10 @@ goto done
 ".venv\Scripts\python.exe" outreach.py run --live
 goto done
 :watch
-".venv\Scripts\python.exe" outreach.py start --live
+".venv\Scripts\python.exe" outreach.py supervise --live
+goto done
+:startup
+".venv\Scripts\python.exe" outreach.py install-startup --live
 goto done
 :status
 ".venv\Scripts\python.exe" outreach.py status

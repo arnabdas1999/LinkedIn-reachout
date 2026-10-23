@@ -4,7 +4,7 @@
   "browser_executable": null,
   "headless": true,
   "timezone": "America/New_York",
-  "state_directory": ".local",
+  "state_directory": "auto",
   "browser_profile_directory": null,
   "message_templates_file": null,
   "campaign_invitation_limit": 1,
@@ -24,7 +24,22 @@
   "retry_max_seconds": 1800,
   "message_1_delay_days": 1,
   "message_2_delay_days": 3,
-  "working_days": [0, 1, 2, 3, 4],
-  "working_hours": [9, 18],
-  "company_filter": ""
+  "working_days": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "working_hours": [
+    9,
+    18
+  ],
+  "company_filter": "",
+  "heartbeat_interval_seconds": 30,
+  "stalled_after_seconds": 300,
+  "desktop_notifications": true,
+  "notification_cooldown_minutes": 30,
+  "backup_interval_hours": 24,
+  "backup_retention": 14
 }

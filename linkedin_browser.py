@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 
 from playwright.sync_api import Error as BrowserError, TimeoutError as BrowserTimeoutError, sync_playwright
 
-from outreach_errors import (AccountBlocked, ContactNeedsReview, ContactNotReady,
+from outreach_errors import (AccountBlocked, ContactNeedsReview, ContactNotReady, CyclePaused, StopRequested,
                              InvitationFormMissing, InvitationHeld, ProfileNeedsReview, StopRun)
 from lead_data import canonical_profile
 
@@ -343,6 +343,18 @@ class LinkedInBrowser:
         self.page.screenshot(path=str(ROOT / ".local" / "invitation-inspection.png"))
         raise InvitationFormMissing("Invitation form was not recognized after Connect; no Send control was clicked")
 
+    def guarded_click(self, control, frame=None):
+        control.click(trial=True)
+        self.guard()
+        if frame is not None:
+            self.guard(frame)
+        callback = getattr(self, 'before_action', None)
+        if callback:
+            callback()
+        # Leave time for a busy renderer to dispatch the input. Navigation and
+        # outcome confirmation are handled explicitly by the caller.
+        control.click(timeout=10000, no_wait_after=True)
+
     def send_invitation(self, lead, message):
         self.guard()
         if self.profile_state() != "new":
@@ -353,7 +365,7 @@ class LinkedInBrowser:
         if connect is None:
             raise ContactNeedsReview("Connect action is missing")
         # This click itself can send on some LinkedIn UI variants. Journal is already committed.
-        connect.click()
+        self.guarded_click(connect)
         try:
             dialog, frame = self.invitation_dialog(lead)
         except InvitationFormMissing as exc:
@@ -383,7 +395,7 @@ class LinkedInBrowser:
         send = self.button(dialog, r"^Send(?: invitation)?$", "Send invitation button", optional=False)
         self.guard()
         self.guard(frame)
-        send.click()
+        self.guarded_click(send, frame)
         try:
             dialog.wait_for(state="hidden", timeout=15000)
         except BrowserError:
@@ -522,7 +534,12 @@ class LinkedInBrowser:
             editor.fill("")
             raise ContactNeedsReview("Conversation changed while composing. Message was not sent")
         send = self.button(panel, r"^Send(?: message)?$", "Send message button", optional=False)
-        send.click()
+        try:
+            self.guarded_click(send, self.message_frame)
+        except (CyclePaused, StopRequested):
+            if normalized(editor.inner_text()) == target:
+                editor.fill('')
+            raise
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
             self.guard()

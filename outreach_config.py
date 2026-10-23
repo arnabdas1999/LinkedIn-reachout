@@ -1,9 +1,12 @@
 """Portable configuration and message-template validation."""
 
 from copy import deepcopy
+import hashlib
 import json
 from pathlib import Path
 import re
+import os
+import sys
 from string import Formatter
 from zoneinfo import ZoneInfo
 
@@ -19,6 +22,9 @@ DEFAULTS = {
     "watch_interval_minutes": 30, "minimum_seconds_between_sends": 60,
     "read_attempts": 2, "contact_retry_limit": 3, "max_consecutive_failures": 3,
     "retry_initial_seconds": 60, "retry_max_seconds": 1800,
+    "heartbeat_interval_seconds": 30, "stalled_after_seconds": 300,
+    "desktop_notifications": True, "notification_cooldown_minutes": 30,
+    "backup_interval_hours": 24, "backup_retention": 14,
     "message_1_delay_days": 1, "message_2_delay_days": 3,
     "working_days": [0, 1, 2, 3, 4], "working_hours": [9, 18], "company_filter": "",
     "connection_note": "Hi {first_name}, I'm looking to expand my network of engineering leaders in and around {location}. Would love to connect!",
@@ -33,6 +39,8 @@ POSITIVE_INTS = (
     "minimum_seconds_between_sends", "message_1_delay_days", "message_2_delay_days",
     "read_attempts", "contact_retry_limit", "max_consecutive_failures",
     "retry_initial_seconds", "retry_max_seconds",
+    "heartbeat_interval_seconds", "stalled_after_seconds", "notification_cooldown_minutes",
+    "backup_interval_hours", "backup_retention",
 )
 ALIASES = {"firstname": "first_name", "companyname": "company", "location": "location",
            "first_name": "first_name", "company": "company"}
@@ -100,6 +108,10 @@ def load_settings(path=None):
         raise ValueError("browser_channel must be brave, msedge, chrome or chromium")
     if type(cfg["headless"]) is not bool:
         raise ValueError("headless must be true or false")
+    if type(cfg['desktop_notifications']) is not bool:
+        raise ValueError('desktop_notifications must be true or false')
+    if cfg['stalled_after_seconds'] < cfg['heartbeat_interval_seconds'] * 2:
+        raise ValueError('stalled_after_seconds must be at least twice heartbeat_interval_seconds')
     ZoneInfo(cfg["timezone"])
     hours, days = cfg["working_hours"], cfg["working_days"]
     if not isinstance(hours, list) or len(hours) != 2 or not all(type(h) is int for h in hours) or not 0 <= hours[0] < hours[1] <= 24:
@@ -122,4 +134,17 @@ def load_settings(path=None):
 
 
 def state_path(cfg):
+    if cfg['state_directory'] == 'auto':
+        return durable_state_path(Path(cfg['_workspace']))
     return resolve_path(cfg["state_directory"], Path(cfg["_workspace"]))
+
+
+def durable_state_path(workspace):
+    identity = hashlib.sha256(str(Path(workspace).resolve()).casefold().encode()).hexdigest()[:12]
+    if sys.platform == 'win32':
+        root = Path(os.environ.get('LOCALAPPDATA', Path.home() / 'AppData/Local'))
+    elif sys.platform == 'darwin':
+        root = Path.home() / 'Library/Application Support'
+    else:
+        root = Path(os.environ.get('XDG_DATA_HOME', Path.home() / '.local/share'))
+    return root / 'LinkedInOutreach' / 'campaigns' / identity
