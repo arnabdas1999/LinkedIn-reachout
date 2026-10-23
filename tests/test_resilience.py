@@ -266,11 +266,16 @@ class SupervisorTests(unittest.TestCase):
                 if len(calls) == 1:
                     raise BrowserError('Browser crashed')
                 return nullcontext(healthy)
-            with patch('outreach.browser_session', side_effect=factory):
+            # The worker and its real campaign must share the fixture clock;
+            # otherwise this recovery test stops sending after business hours.
+            with (patch('outreach.browser_session', side_effect=factory),
+                  patch('outreach.Campaign', side_effect=lambda *args, **kwargs:
+                        Campaign(*args, now=lambda: self.clock, **kwargs))):
                 self.run_worker(lambda: browser_cycle(store, cfg, self.root / 'stop'),
                                 lambda seconds: len(calls) >= 2)
             self.assertEqual(len(calls), 2)
             self.assertEqual(len(healthy.sends), 1)
             self.assertEqual(store.used('invite'), 1)
+            self.assertEqual(store.db.execute('SELECT started_at FROM actions').fetchone()[0], stamp(self.clock))
         finally:
             store.close()
